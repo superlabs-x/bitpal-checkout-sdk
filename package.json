@@ -1,0 +1,65 @@
+{
+  "name": "@bitpal/checkout",
+  "version": "0.5.0",
+  "description": "BitPal Checkout SDK — non-custodial crypto checkout: create sessions, issue per-order deposit addresses, poll status, verify signed webhooks.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/superlabs-x/bitpal-checkout-sdk.git"
+  },
+  "homepage": "https://github.com/superlabs-x/bitpal-checkout-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/superlabs-x/bitpal-checkout-sdk/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "bitpal",
+    "checkout",
+    "crypto",
+    "usdc",
+    "payments",
+    "sdk",
+    "evm",
+    "base",
+    "stablecoin",
+    "non-custodial"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm test && npm run build",
+    "release": "npm publish --access public"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.9"
+  }
+}

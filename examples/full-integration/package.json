@@ -1,0 +1,14 @@
+{
+  "name": "bitpal-merchant-integration-example",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "BitPal SDK + webhook + idempotency + refund을 한 백엔드에서 묶어 쓰는 reference. production-grade 아님 — 통합 패턴 예시용.",
+  "scripts": {
+    "start": "node --env-file=.env server.mjs"
+  },
+  "dependencies": {
+    "@bitpal/checkout": "^0.5.0",
+    "express": "^4.21.0"
+  }
+}
