@@ -1,6 +1,6 @@
 {
   "name": "@bitpal/checkout",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "BitPal Checkout SDK — non-custodial crypto checkout: create sessions, issue per-order deposit addresses, poll status, verify signed webhooks.",
   "license": "MIT",
   "repository": {

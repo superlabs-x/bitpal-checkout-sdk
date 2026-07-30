@@ -77,6 +77,14 @@ export interface CreateSessionParams {
    * 예: ['eip155:84532', 'eip155:11155420', 'eip155:80002', 'eip155:421614']
    */
   allowed_pay_chains?: string[];
+  /**
+   * chain×token cell 허용 목록(**결제 수단** 표준 입력) — buyer 가 (체인, 토큰) 조합을 고른다.
+   * allowed_pay_chains(×단일 currency shorthand)보다 우선. 서로 다른 토큰을 섞을 때 사용.
+   * `chain` 은 short-name('base','tron','solana') 또는 CAIP-2 둘 다 허용(서버가 mode-relative 로 정규화).
+   * paymentLinks.allowed_assets 와 동일 형태(SDK 일관).
+   * 예: [{ chain: 'base', token: 'USDC' }, { chain: 'tron', token: 'USDT' }]
+   */
+  allowed_assets?: Array<{ chain: string; token: string }>;
   /** 결제 자산 (예: USDC) */
   pay_asset?: string;
   /** 허용 오차 (%, 기본값: 2.00) */

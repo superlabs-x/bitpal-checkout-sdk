@@ -134,7 +134,15 @@ export class BitPalCheckoutClient {
       throw new Error('[BitPal] pay_chain and allowed_pay_chains are mutually exclusive — use only one.');
     }
     // one-of 검증만 — amount(사람 USD) / amount_atomic(raw μUSD) 변환은 서버가 수행.
-    const body = { ...params, line_items: params.line_items.map(validateLineItem) };
+    //   allowed_assets 는 SDK 표준 {chain, token} → createSession API 필드명(caip2)으로 매핑.
+    //   chain 값(short-name/CAIP-2)은 서버가 mode-relative 로 정규화(payment-link 는 API 가 직접 chain 수용).
+    const body = {
+      ...params,
+      line_items: params.line_items.map(validateLineItem),
+      ...(params.allowed_assets
+        ? { allowed_assets: params.allowed_assets.map((a) => ({ caip2: a.chain, token: a.token })) }
+        : {}),
+    };
     const res = await this.request<ApiResponse<CheckoutSession>>(
       'POST',
       '/v1/checkout/sessions',

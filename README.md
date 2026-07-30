@@ -63,10 +63,16 @@ shows the per-order deposit address + QR, and confirms the payment on-chain.
 ```ts
 const { data: session } = await bitpal.checkout.createSession({
   line_items: [
-    { name: 'Pro Plan', amount: '29', currency: 'USDC' },  // just the USD number
+    { name: 'Pro Plan', amount: '29', currency: 'USDC' },  // `currency` = price denomination (USD via USDC)
   ],
-  pay_chain: 'eip155:84532',     // Base Sepolia (test mode). Live mode: 'eip155:8453' (Base mainnet).
-                                 // Or use allowed_pay_chains for a buyer-picked chain.
+  // Payment options the buyer may choose — (chain, token) pairs. Mix tokens freely.
+  //   `chain` accepts a short-name ('base' | 'arbitrum' | 'bnb' | 'tron' | 'solana') or a CAIP-2 id;
+  //   it resolves to the right testnet/mainnet chain for your mode (test vs live key) automatically.
+  allowed_assets: [
+    { chain: 'base',   token: 'USDC' },
+    { chain: 'tron',   token: 'USDT' },
+    { chain: 'solana', token: 'USDC' },
+  ],
   expires_in_seconds: 1800,
   success_url: 'https://yourstore.com/thanks',
 });
@@ -75,7 +81,13 @@ const { data: session } = await bitpal.checkout.createSession({
 redirect(session.checkout_url!);
 ```
 
-`pay_chain` (single fixed chain) and `allowed_pay_chains` (buyer picks) are mutually exclusive.
+**Setting the payment options** (precedence, highest first):
+
+- **`allowed_assets`** — `(chain, token)` cells. The standard, most explicit way; the buyer picks any listed pair (lets you mix tokens, e.g. USDC on Base + USDT on Tron).
+- `allowed_pay_chains: string[]` — shorthand for "the line-item `currency` across these chains" (one token, many chains).
+- `pay_chain: string` — a single fixed chain, no buyer choice.
+
+`pay_chain` and `allowed_pay_chains` are mutually exclusive; `allowed_assets` takes precedence over both. Omit all three and it defaults to **one chain × the line-item currency**. `currency` on the line item is always the **price denomination** (what the amount is quoted in) — independent of which token the buyer pays with.
 
 ### Self-hosted flow: issue a deposit address yourself
 
@@ -89,7 +101,7 @@ const { data } = await bitpal.checkout.issueDepositAddress(session.id, {
   session_token: session.session_token!, // from createSession
   refundAddress: '0xBuyerWallet...',      // VM-matched (EVM 0x… / Tron T… / Solana base58); committed, immutable after issuance
   chain: 'eip155:84532',                  // match the session's chain (test: Base Sepolia / live: eip155:8453).
-                                          // only needed for multi-option (allowed_pay_chains) sessions
+                                          // only needed for multi-option (allowed_assets / allowed_pay_chains) sessions
   token: 'USDC',
 });
 
