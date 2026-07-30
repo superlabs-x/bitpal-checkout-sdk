@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { BitPalCheckoutClient } from './client.js';
 
-describe('@bitpal/checkout — deposit-address 결제', () => {
+describe('@bitpal/checkout — 안2 deposit-address 결제', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -12,6 +12,30 @@ describe('@bitpal/checkout — deposit-address 결제', () => {
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }));
   }
+
+  it('createSession — amount(사람 USD) / amount_atomic(raw μUSD) 그대로 전달(변환은 서버)', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    stub(calls, { data: { id: 'cs_1', status: 'created', amount_total: '0', currency: 'USDC', line_items: [] } });
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await client.createSession({
+      line_items: [
+        { name: 'A', amount: '20', currency: 'USDC' },
+        { name: 'B', amount: '0.5', currency: 'USDT' },
+        { name: 'C', amount_atomic: '1000000', currency: 'USDC' }, // raw μUSD 직접(고급)
+      ],
+    });
+    const sent = JSON.parse(String(calls[0]!.init.body));
+    // SDK 는 변환하지 않고 그대로 전달 — API 가 canonical μUSD 로 정규화.
+    expect(sent.line_items[0].amount).toBe('20');
+    expect(sent.line_items[1].amount).toBe('0.5');
+    expect(sent.line_items[2].amount_atomic).toBe('1000000');
+  });
+
+  it('createSession — amount/amount_atomic 둘 다 또는 둘 다 없음 → throw', async () => {
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await expect(client.createSession({ line_items: [{ name: 'A', currency: 'USDC' } as never] })).rejects.toThrow(/exactly one/);
+    await expect(client.createSession({ line_items: [{ name: 'A', currency: 'USDC', amount: '1', amount_atomic: '1000000' } as never] })).rejects.toThrow(/exactly one/);
+  });
 
   it('issueDepositAddress → POST /deposit-address (session_token + chain/token + refundAddress)', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -48,13 +72,30 @@ describe('@bitpal/checkout — deposit-address 결제', () => {
     });
   });
 
-  it('getPublicSession → GET /public (인증 불요, payment_options)', async () => {
+  it('getPublicSession → GET /public (멀티VM payment_options + decimals)', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
-    stub(calls, { data: { id: 'cs_123', status: 'created', payment_options: [{ caip2: 'eip155:8453', chain_id: 8453, token_symbol: 'USDC', token_address: '0x' + 'cd'.repeat(20) }] } });
+    // EVM(6dp) + BNB USDT(18dp) + Solana(6dp, base58 mint) — chain_id 는 비-EVM 에서 null.
+    stub(calls, { data: { id: 'cs_123', status: 'created', token_decimals: 6, payment_options: [
+      { caip2: 'eip155:8453', chain_id: 8453, token_symbol: 'USDC', token_address: '0x' + 'cd'.repeat(20), decimals: 6 },
+      { caip2: 'eip155:97', chain_id: 97, token_symbol: 'USDT', token_address: '0x' + 'ef'.repeat(20), decimals: 18 },
+      { caip2: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', chain_id: null, token_symbol: 'USDC', token_address: '5j85fTizkSWaUWvc5gT1QxPVN5jZayxgQxsMivE8WR37', decimals: 6 },
+    ] } });
     const client = new BitPalCheckoutClient({ apiKey: 'bp_test_123', baseUrl: 'http://api.test' });
     const res = await client.getPublicSession('cs_123');
     expect(calls[0]!.url).toBe('http://api.test/v1/checkout/sessions/cs_123/public');
-    expect(res.data.payment_options[0]!.token_symbol).toBe('USDC');
+    expect(res.data.payment_options[0]!.decimals).toBe(6);
+    expect(res.data.payment_options[1]!.decimals).toBe(18); // non-6dp 노출
+    expect(res.data.payment_options[2]!.chain_id).toBeNull(); // Solana=비-EVM
+    expect(res.data.token_decimals).toBe(6);
+  });
+
+  it('issueDepositAddress — Solana base58 refundAddress 통과(EVM 전용 아님)', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const solRefund = 'UxV98Jw3fEZwG5afZZQaWgAfdZARemuGfgrneTdq5KR';
+    stub(calls, { data: { sessionId: 'cs_9', chain: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', depositAddress: solRefund, expectedToken: '5j85fTizkSWaUWvc5gT1QxPVN5jZayxgQxsMivE8WR37', expectedAmount: '1000000', feeAmount: '0', refundAddress: solRefund, deadline: '1778650000', expiresAt: null } });
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_123', baseUrl: 'http://api.test' });
+    await client.issueDepositAddress('cs_9', { session_token: 's', refundAddress: solRefund, chain: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', token: 'USDC' });
+    expect(JSON.parse(String(calls[0]!.init.body))).toMatchObject({ refundAddress: solRefund });
   });
 
   it('getStatus → GET /status (경량 폴링)', async () => {

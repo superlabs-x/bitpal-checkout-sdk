@@ -8,6 +8,7 @@
 import type {
   BitPalConfig,
   CreateSessionParams,
+  CheckoutLineItemInput,
   CheckoutSession,
   PublicSession,
   SessionStatus,
@@ -17,7 +18,22 @@ import type {
   ApiResponse,
   ListResponse,
 } from './types.js';
-import { ProductsResource, PricesResource } from './catalog.js';
+import { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
+
+/**
+ * line item one-of 검증 — 금액은 `amount`(사람 USD) XOR `amount_atomic`(raw μUSD) 중 하나.
+ * 변환은 서버가 수행하므로 SDK 는 그대로 전달(체인/토큰 decimal 무관 — 발급 시 서버가 재스케일).
+ * price_id 항목은 서버가 금액 resolve 하므로 그대로. 둘 다/둘 다없음은 SDK 가 즉시 에러.
+ */
+function validateLineItem(li: CheckoutLineItemInput): CheckoutLineItemInput {
+  if ('price_id' in li) return li;
+  const hasHuman = li.amount != null;
+  const hasAtomic = li.amount_atomic != null;
+  if (hasHuman === hasAtomic) {
+    throw new Error('[BitPal] line item requires exactly one of `amount` (USD number, e.g. "29") or `amount_atomic` (raw μUSD integer, e.g. "29000000").');
+  }
+  return li;
+}
 
 const DEFAULT_BASE_URL = 'https://api.bitpal.io';
 const DEFAULT_TIMEOUT = 30_000;
@@ -32,6 +48,8 @@ export class BitPalCheckoutClient {
   readonly products: ProductsResource;
   /** PROD-LINK-3a-SDK: immutable Price 관리 — 가격 변경은 비활성화 + 새 price 생성 */
   readonly prices: PricesResource;
+  /** PROD-LINK-4-SDK: Payment Link 관리 — 대시보드 없이 코드로 결제 링크 생성 (server-side 전용) */
+  readonly paymentLinks: PaymentLinksResource;
 
   constructor(config: BitPalConfig) {
     // apiKey 선택 — 서버 메서드는 필요(없으면 서버가 401), 공개 메서드는 apiKey 없이 동작.
@@ -43,6 +61,7 @@ export class BitPalCheckoutClient {
       this.request<T>(method, path, body);
     this.products = new ProductsResource(requester);
     this.prices = new PricesResource(requester);
+    this.paymentLinks = new PaymentLinksResource(requester);
   }
 
   /* ─── 내부 HTTP ─── */
@@ -88,20 +107,22 @@ export class BitPalCheckoutClient {
   /**
    * 체크아웃 세션 생성.
    *
-   * 모든 `line_items[].amount`는 atomic μUSDC 정수 문자열이어야 한다 ($1 = "1000000").
-   * decimal 표기는 거부된다 — `toAtomicUSDC()` 헬퍼 사용 권장.
+   * `line_items[].amount` 는 사람 표기 USD 문자열("29", "0.5") — decimal 계산 불필요.
+   * 이미 raw μUSD 정수라면 `amount_atomic`("29000000") 사용(고급). 둘은 상호 배타.
    *
    * @example
-   * import { BitPal, toAtomicUSDC } from '@bitpal/checkout';
+   * import { BitPal } from '@bitpal/checkout';
    * const bp = new BitPal('bp_test_...');
    * const { data } = await bp.checkout.createSession({
-   *   line_items: [{ name: 'Pro', amount: toAtomicUSDC('29.00'), currency: 'USDC' }],
+   *   // amount: 사람 표기 USD("29", "0.5"). 금액은 USD 가격이라 체인/토큰 decimal 무관.
+   *   line_items: [{ name: 'Pro', amount: '29', currency: 'USDC' }],
    * });
    * console.log(data.url); // → buyer를 redirect할 결제 페이지
    *
    * // 멀티체인 허용 — 구매자가 Base/Optimism 중 선택(하나뿐이면 자동 선택):
+   * //   어떤 체인·토큰이든 amount 그대로 — 서버가 발급 시 토큰 decimals 로 재스케일.
    * await bp.checkout.createSession({
-   *   line_items: [{ name: 'Pro', amount: toAtomicUSDC('29.00'), currency: 'USDC' }],
+   *   line_items: [{ name: 'Pro', amount: '29', currency: 'USDC' }],
    *   allowed_pay_chains: ['eip155:84532', 'eip155:11155420'],
    * });
    * // 단일 체인 고정은 pay_chain 사용(둘은 상호 배타).
@@ -112,10 +133,12 @@ export class BitPalCheckoutClient {
     if (params.pay_chain && params.allowed_pay_chains && params.allowed_pay_chains.length > 0) {
       throw new Error('[BitPal] pay_chain and allowed_pay_chains are mutually exclusive — use only one.');
     }
+    // one-of 검증만 — amount(사람 USD) / amount_atomic(raw μUSD) 변환은 서버가 수행.
+    const body = { ...params, line_items: params.line_items.map(validateLineItem) };
     const res = await this.request<ApiResponse<CheckoutSession>>(
       'POST',
       '/v1/checkout/sessions',
-      params,
+      body,
     );
     // Backend가 token 쿼리까지 포함한 정확한 URL을 `checkout_url`로 보낸다.
     // SDK는 mirror해서 `url`로도 노출 (backwards compat). 자체적으로 URL을 조립하지 않는 이유:
@@ -153,7 +176,7 @@ export class BitPalCheckoutClient {
     );
   }
 
-  /* ─── 비수탁 결제 (deposit-address) ─── */
+  /* ─── 안2 비수탁 결제 (deposit-address) ─── */
 
   /**
    * 공개 세션 조회 (`GET /v1/checkout/sessions/:id/public`) — 인증 불요.
@@ -171,7 +194,7 @@ export class BitPalCheckoutClient {
   /**
    * 주문별 비수탁 입금주소 발급 (`POST /v1/checkout/sessions/:id/deposit-address`).
    *
-   * 비수탁 결제 진입점. 구매자가 자산(멀티옵션이면 chain/token)과 환불 주소를 확정하면 서버가
+   * 안2 결제 진입점. 구매자가 자산(멀티옵션이면 chain/token)과 환불 주소를 확정하면 서버가
    * 그 주문 전용 CREATE2 forwarder 주소를 돌려준다. 구매자는 아무 지갑/거래소에서 **정확한 금액**을
    * 그 주소로 일반 송금하면 된다(서명·연결 불필요). watcher 가 감지 → keeper 가 정산.
    *

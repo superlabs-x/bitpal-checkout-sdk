@@ -6,6 +6,9 @@
  *
  * v0.4 breaking: 서명 = HMAC(`${X-Webhook-Timestamp}.${body}`) (replay 방어). verify 는
  * timestamp(ISO)를 필수로 받고 freshness(tolerance)를 검사한다.
+ *
+ * Backend 단위 테스트는:
+ *   apps/api/src/__tests__/webhook-canonical-delivery.test.ts
  */
 import { describe, it, expect } from 'vitest';
 import { createHmac } from 'node:crypto';
@@ -34,7 +37,7 @@ describe('@bitpal/checkout — CHECKOUT_WEBHOOK_EVENTS canonical names', () => {
     }
   });
 
-  it('이벤트 7종 정확 일치 (backend 계약과 drift 없음)', () => {
+  it('안2 이벤트 7종 정확 일치 (backend checkout-webhook.ts 와 drift 없음)', () => {
     expect([...CHECKOUT_WEBHOOK_EVENTS].sort()).toEqual([
       'checkout.refund.recorded',
       'checkout.session.created',

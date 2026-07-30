@@ -10,8 +10,8 @@
  * const bitpal = new BitPal({ apiKey: 'bp_test_...' });
  *
  * const { data: session } = await bitpal.checkout.createSession({
- *   // amount 는 원자 단위 μUSDC 문자열(6 decimals). $29.00 → '29000000'. toAtomicUSDC 사용 권장.
- *   line_items: [{ name: 'Pro Plan', amount: toAtomicUSDC('29.00'), currency: 'USDC' }],
+ *   // amount: 사람 표기 USD("29","0.5"). decimal 계산 불필요 — 체인/토큰 decimal 무관.
+ *   line_items: [{ name: 'Pro Plan', amount: '29', currency: 'USDC' }],
  * });
  *
  * console.log(session.url); // 호스티드 결제 페이지 URL (checkout_url 별칭)
@@ -30,7 +30,7 @@ export type {
   IdempotencyOptions,
   ApiResponse,
   ListResponse,
-  // 비수탁 입금주소 결제
+  // 안2 비수탁 입금주소 결제
   PublicSession,
   SessionStatus,
   PaymentOption,
@@ -45,8 +45,13 @@ export type {
   UpdatePriceParams,
   ListProductsParams,
   ListPricesParams,
+  // PROD-LINK-4-SDK: Payment Link 관리
+  CheckoutPaymentLink,
+  CreatePaymentLinkParams,
+  UpdatePaymentLinkParams,
+  ListPaymentLinksParams,
 } from './types.js';
-export { ProductsResource, PricesResource } from './catalog.js';
+export { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
 
 export {
   verifyWebhookSignature,
@@ -56,7 +61,7 @@ export {
 } from './webhook.js';
 export type { CheckoutWebhookEvent, WebhookPayload } from './webhook.js';
 
-export { toAtomicUSDC, fromAtomicUSDC } from './amount.js';
+export { toAtomic, fromAtomic, toAtomicUSDC, fromAtomicUSDC } from './amount.js';
 
 
 // 편의 팩토리

@@ -27,6 +27,10 @@ import type {
   UpdatePriceParams,
   ListProductsParams,
   ListPricesParams,
+  CheckoutPaymentLink,
+  CreatePaymentLinkParams,
+  UpdatePaymentLinkParams,
+  ListPaymentLinksParams,
 } from './types.js';
 
 /** client.ts의 private request를 리소스에 주입하기 위한 시그니처 */
@@ -91,5 +95,44 @@ export class PricesResource {
    */
   update(priceId: string, params: UpdatePriceParams): Promise<ApiResponse<CheckoutPrice>> {
     return this.request('PATCH', `/v1/checkout/prices/${encodeURIComponent(priceId)}`, params);
+  }
+}
+
+/**
+ * Payment Link 리소스 — 대시보드 없이 코드로 결제 링크 생성/관리 (PROD-LINK-4).
+ *
+ * 흐름: product 생성 → price 생성 → payment link 생성. link↔price binding 은 생성 후 고정.
+ *
+ * ```ts
+ * const { data: product } = await bitpal.checkout.products.create({ name: 'Pro Plan' });
+ * const { data: price }   = await bitpal.checkout.prices.create(product.id, { amount: '29' });
+ * const { data: link }    = await bitpal.checkout.paymentLinks.create({
+ *   price_id: price.id,
+ *   allowed_pay_chains: ['eip155:8453', 'solana:5eykt4Us…'],
+ * });
+ * // 호스티드 결제 페이지 URL: `{checkoutBase}/plink/${link.share_token}`
+ * ```
+ */
+export class PaymentLinksResource {
+  constructor(private readonly request: CatalogRequester) {}
+
+  /** POST /v1/checkout/payment-links */
+  create(params: CreatePaymentLinkParams): Promise<ApiResponse<CheckoutPaymentLink>> {
+    return this.request('POST', '/v1/checkout/payment-links', params);
+  }
+
+  /** GET /v1/checkout/payment-links */
+  list(params?: ListPaymentLinksParams): Promise<ListResponse<CheckoutPaymentLink>> {
+    return this.request('GET', `/v1/checkout/payment-links${toQuery(params)}`);
+  }
+
+  /** GET /v1/checkout/payment-links/:id */
+  retrieve(linkId: string): Promise<ApiResponse<CheckoutPaymentLink>> {
+    return this.request('GET', `/v1/checkout/payment-links/${encodeURIComponent(linkId)}`);
+  }
+
+  /** PATCH /v1/checkout/payment-links/:id */
+  update(linkId: string, params: UpdatePaymentLinkParams): Promise<ApiResponse<CheckoutPaymentLink>> {
+    return this.request('PATCH', `/v1/checkout/payment-links/${encodeURIComponent(linkId)}`, params);
   }
 }

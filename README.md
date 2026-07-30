@@ -11,24 +11,26 @@ pnpm add @bitpal/checkout
 # npm i @bitpal/checkout / yarn add @bitpal/checkout
 ```
 
-## ⚠️ Amount format (read this first)
+## Amounts — just pass a human number
 
-USDC / USDT have **6 decimals**. All amounts are **atomic μUSDC integer strings** — never floats.
-
-```
-$1.00  → "1000000"
-$29.00 → "29000000"
-$0.50  → "500000"
-```
-
-Passing a decimal string like `"29.00"` returns **400**. Use the helpers:
+Use **`amount`** in line items — a plain USD string like `"20"`, `"0.5"`, `"29.00"`. No decimals to compute.
 
 ```ts
-import { toAtomicUSDC, fromAtomicUSDC } from '@bitpal/checkout';
-
-toAtomicUSDC('29.00');      // → "29000000"
-fromAtomicUSDC('29000000'); // → "29.00"
+line_items: [{ name: 'Pro', amount: '29', currency: 'USDC' }]
 ```
+
+**The amount is a USD price — it does NOT depend on the chain or token decimals.** Whether the buyer pays with USDC (6dp) on Base or USDT (18dp) on BNB, you pass the same `amount`. BitPal rescales to the buyer's chosen token at deposit time. So you never compute per-token decimals. (Prices via `prices.create` take the same `amount`.)
+
+<details><summary>Advanced: raw atomic amounts</summary>
+
+If you already hold **atomic μUSD integer strings** ($1 = `"1000000"`), pass `amount_atomic` instead (mutually exclusive with `amount`):
+
+```
+$1.00 → "1000000"   $29.00 → "29000000"   $0.50 → "500000"
+```
+
+Helpers for atomic conversion (e.g. reading `amount_total` back): `toAtomic(v, decimals)` / `fromAtomic(v, decimals)` — read `decimals` from `payment_options[]`/`token_decimals` (6 for USDC/USDT, 18 for BNB USDT). `toAtomicUSDC`/`fromAtomicUSDC` are 6dp shortcuts.
+</details>
 
 ## Environments
 
@@ -45,8 +47,8 @@ there is no separate flag.
 ### Setup
 
 ```ts
-// helpers (toAtomicUSDC / fromAtomicUSDC) are used in the snippets below
-import { BitPal, toAtomicUSDC, fromAtomicUSDC } from '@bitpal/checkout';
+import { BitPal } from '@bitpal/checkout';
+// (optional atomic helpers if you need them: import { toAtomic, fromAtomic } from '@bitpal/checkout')
 
 const bitpal = new BitPal(process.env.BITPAL_API_KEY!); // bp_test_... / bp_live_...
 ```
@@ -61,7 +63,7 @@ shows the per-order deposit address + QR, and confirms the payment on-chain.
 ```ts
 const { data: session } = await bitpal.checkout.createSession({
   line_items: [
-    { name: 'Pro Plan', amount: toAtomicUSDC('29.00'), currency: 'USDC' },
+    { name: 'Pro Plan', amount: '29', currency: 'USDC' },  // just the USD number
   ],
   pay_chain: 'eip155:84532',     // Base Sepolia (test mode). Live mode: 'eip155:8453' (Base mainnet).
                                  // Or use allowed_pay_chains for a buyer-picked chain.
@@ -85,7 +87,7 @@ you.
 ```ts
 const { data } = await bitpal.checkout.issueDepositAddress(session.id, {
   session_token: session.session_token!, // from createSession
-  refundAddress: '0xBuyerWallet...',      // committed to the address, immutable after issuance
+  refundAddress: '0xBuyerWallet...',      // VM-matched (EVM 0x… / Tron T… / Solana base58); committed, immutable after issuance
   chain: 'eip155:84532',                  // match the session's chain (test: Base Sepolia / live: eip155:8453).
                                           // only needed for multi-option (allowed_pay_chains) sessions
   token: 'USDC',
@@ -195,10 +197,9 @@ new BitPal({ apiKey, baseUrl: 'https://…' }); // config object — override ba
 
 ## Runnable examples
 
-The [source repo](https://github.com/superlabs-x/bitpal-checkout-sdk)'s `examples/` directory
-has runnable references (not shipped in the npm package): `create-session.mjs`,
-`webhook-receiver.mjs`, and a `full-integration/` Express store wiring session creation +
-webhook verification + idempotency.
+The source repo's `examples/` directory has runnable references (not shipped in the npm
+package): `create-session.mjs`, `webhook-receiver.mjs`, and a `full-integration/` Express
+store wiring session creation + webhook verification + idempotency.
 
 ## Build
 
@@ -213,7 +214,7 @@ pnpm build   # tsup → dist/ (ESM + .d.ts)
   `verifyWebhookSignature(rawBody, sigHeader, secret, { timestamp: tsHeader })`. A 3-argument call now
   returns `false`. The signed content changed from `body` to `` `${timestamp}.${body}` ``.
 - Deduplicate on the signed `event.id`, not the `X-Webhook-Id` header.
-- Removed legacy pre-release methods (`payWithAuthorization`, `submitExternalPayment`) and escrow refund helpers —
+- Removed 안1 methods (`payWithAuthorization`, `submitExternalPayment`) and escrow refund helpers —
   checkout is non-custodial deposit-address (see Usage above).
 
 ## License

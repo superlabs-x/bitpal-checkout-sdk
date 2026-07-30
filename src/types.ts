@@ -27,16 +27,30 @@ export interface BitPalConfig {
   timeout?: number;
 }
 
+/** 응답/정규화된 line item — amount 는 항상 atomic μUSD 정수. */
 export interface LineItem {
   name: string;
-  /**
-   * Atomic μUSDC 정수 문자열 (USDC/USDT 6 decimals).
-   * $1 = "1000000", $29 = "29000000".
-   * decimal 표기는 거부된다 — `toAtomicUSDC('29.00')` 헬퍼 사용 권장.
-   */
+  /** Atomic μUSD 정수 문자열($1="1000000", $29="29000000"). */
   amount: string;
   currency: string;
   quantity?: number;
+}
+
+/**
+ * 세션 생성 입력용 line item. 금액은 둘 중 **하나**:
+ *   - `amount`(권장): 사람 표기 USD 문자열(예 "29", "0.5", "29.00"). decimal 신경 쓸 필요 없음.
+ *     ※ 금액은 **USD 가격**이다(체인/토큰 decimal 무관). 토큰(USDC 6dp / BNB USDT 18dp)별 스케일은 발급 시 서버가 처리.
+ *   - `amount_atomic`: 이미 raw μUSD 정수 문자열($1="1000000")인 경우(고급/기존 코드).
+ * 둘 다 지정하거나 둘 다 생략하면 SDK 가 에러를 throw 한다.
+ */
+export interface LineItemInput {
+  name: string;
+  currency: string;
+  quantity?: number;
+  /** 사람 표기 USD 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  amount?: string;
+  /** raw μUSD 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  amount_atomic?: string;
 }
 
 // PROD-LINK-3b: SDK Catalog Checkout — BitPal에 저장된 price_id 참조 line item.
@@ -49,7 +63,7 @@ export interface PriceLineItem {
   quantity?: number;
 }
 
-export type CheckoutLineItemInput = LineItem | PriceLineItem;
+export type CheckoutLineItemInput = LineItemInput | PriceLineItem;
 
 export interface CreateSessionParams {
   line_items: CheckoutLineItemInput[];
@@ -93,7 +107,7 @@ export interface CheckoutSession {
   settled_at: string | null;
   tx_hash: string | null;
   created_at: string;
-  /** 'hosted' — 결제 경로. hosted deposit-address 단일 경로. */
+  /** 'hosted' — 결제 경로. 안2 는 hosted deposit-address 단일 경로. */
   payment_source?: string;
   /** 호스티드 결제 페이지 URL (token 쿼리 포함). backend 응답 그대로 사용 — buyer를 이 URL로 redirect. */
   checkout_url?: string;
@@ -104,15 +118,19 @@ export interface CheckoutSession {
 }
 
 /**
- * 결제 옵션(chain×token). `/public` 이 서버 권위로 내려주며, buyer 가 하나를 골라
+ * 안2 결제 옵션(chain×token). `/public` 이 서버 권위로 내려주며, buyer 가 하나를 골라
  * `issueDepositAddress({ chain, token })` 로 입금주소를 발급받는다. 단일-자산 세션은 1개.
  */
 export interface PaymentOption {
-  /** CAIP-2 (예: eip155:8453) */
+  /** CAIP-2 (예: eip155:8453, tron:0x2b6653dc, solana:5eykt4…). 체인 식별의 canonical. */
   caip2: string;
-  chain_id: number;
+  /** EVM numeric chainId. 비-EVM(Tron/Solana)은 null — 식별은 caip2 사용. */
+  chain_id: number | null;
   token_symbol: string;
+  /** 토큰 컨트랙트/mint 주소(EVM 0x / Tron base58 / Solana base58 mint). */
   token_address: string;
+  /** 토큰 decimals(USDC/USDT=6, BSC-USD=18). atomic↔decimal 변환에 필수 — 6dp 가정 금지. */
+  decimals: number;
 }
 
 /**
@@ -136,6 +154,8 @@ export interface PublicSession {
   payment_options: PaymentOption[];
   chain_id: number | null;
   token_address: string | null;
+  /** 선택된 pay 토큰 decimals(발급 후). amount_total/amount_received atomic 해석에 사용 — 6dp 가정 금지. */
+  token_decimals?: number | null;
   tx_hash: string | null;
   release_tx_hash?: string | null;
   expires_at: string | null;
@@ -158,7 +178,11 @@ export interface PublicSession {
 export interface IssueDepositAddressParams {
   /** 결제 페이지 접근 증명(HMAC). createSession 응답의 session_token. */
   session_token: string;
-  /** 환불 주소(0x EVM). 필수. */
+  /**
+   * 환불 주소. 필수. 선택한 체인의 VM 형식이어야 한다:
+   *   EVM=0x…, Tron=base58(T…), Solana=base58. 결제와 같은 네트워크의 본인 주소.
+   * 금액부족/잘못된토큰/만료 시 이 주소로 환불되며, 입금주소에 커밋되어 발급 후 변경 불가.
+   */
   refundAddress: string;
   /** 선택 자산의 chain(CAIP-2 또는 short-name). 멀티옵션 세션 필수. */
   chain?: string;
@@ -172,7 +196,7 @@ export interface IssueDepositAddressParams {
 export interface DepositAddress {
   sessionId: string;
   chain: string;
-  /** 주문별 CREATE2 forwarder 입금주소. */
+  /** 주문별 결정적 입금주소(EVM/Tron=CREATE2 forwarder, Solana=order PDA 의 deposit ATA). */
   depositAddress: string;
   expectedToken: string;
   /** Atomic 정수 문자열. */
@@ -278,9 +302,17 @@ export interface UpdateProductParams {
   status?: 'active' | 'inactive';
 }
 
+/**
+ * 가격 생성 입력. 금액은 둘 중 **하나** (line item 과 동일 모델):
+ *   - `amount`(권장): 사람 표기 USD 문자열(예 "29", "0.5"). decimal 신경 쓸 필요 없음.
+ *   - `amount_atomic`: raw μUSD 정수($1="1000000") — 고급/기존.
+ * 둘 다 지정하거나 둘 다 생략하면 서버가 400 을 반환한다.
+ */
 export interface CreatePriceParams {
-  /** 원자 단위 정수 문자열 ($1 = "1000000"). `toAtomicUSDC('1.00')` 헬퍼 사용 권장 */
-  amount_atomic: string;
+  /** 사람 표기 USD 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  amount?: string;
+  /** raw μUSD 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  amount_atomic?: string;
   currency?: string;
   token_symbol?: string;
   billing_type?: 'one_time';
@@ -304,6 +336,80 @@ export interface ListProductsParams {
 }
 
 export interface ListPricesParams {
+  limit?: number;
+  offset?: number;
+}
+
+// ── Payment Link 관리 (server-side) ──
+// 대시보드 UI 없이 코드로 결제 링크를 만드는 경로. 흐름: product → price → payment link.
+// link ↔ price binding 은 생성 후 고정(immutable) — 다른 가격은 새 링크로. share_token 은
+// 서버가 자동 생성하며 호스티드 결제 URL 은 `{checkoutBase}/plink/{share_token}` 형태.
+
+export interface CheckoutPaymentLink {
+  /** plink_... */
+  id: string;
+  /** 고엔트로피 공개 토큰 — 호스티드 URL `{checkoutBase}/plink/{share_token}` 에 사용 */
+  share_token: string;
+  /** price_... — 이 링크가 파는 가격(생성 후 고정) */
+  price_id: string;
+  title: string | null;
+  description: string | null;
+  collect_email: boolean;
+  email_required: boolean;
+  /** CAIP-2 목록 또는 null(legacy) */
+  allowed_pay_chains: string[] | null;
+  /** chain×token cell 목록 또는 null */
+  allowed_assets: Array<{ caip2: string; token: string }> | null;
+  success_url: string | null;
+  cancel_url: string | null;
+  /** 'active' | 'inactive' */
+  status: string;
+  max_uses: number | null;
+  paid_use_count: number;
+  expires_at: string | null;
+  mode: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatePaymentLinkParams {
+  /** price_... — bitpal.checkout.prices.create() 로 만든 가격. 필수. */
+  price_id: string;
+  title?: string;
+  description?: string;
+  /** buyer 이메일 수집(기본 true) */
+  collect_email?: boolean;
+  /** buyer 이메일 필수(기본 true). true 면 collect_email 도 true 여야 함. */
+  email_required?: boolean;
+  /** 허용 결제 체인(CAIP-2 또는 short-name). allowed_assets 가 있으면 그쪽 우선. */
+  allowed_pay_chains?: string[];
+  /** chain×token cell 허용 목록 — allowed_pay_chains 보다 우선. */
+  allowed_assets?: Array<{ chain: string; token: string }>;
+  success_url?: string;
+  cancel_url?: string;
+  max_uses?: number;
+  /** ISO-8601 datetime */
+  expires_at?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface UpdatePaymentLinkParams {
+  title?: string | null;
+  description?: string | null;
+  collect_email?: boolean;
+  email_required?: boolean;
+  allowed_pay_chains?: string[] | null;
+  allowed_assets?: Array<{ chain: string; token: string }> | null;
+  success_url?: string | null;
+  cancel_url?: string | null;
+  status?: 'active' | 'inactive';
+  max_uses?: number | null;
+  expires_at?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ListPaymentLinksParams {
+  status?: 'active' | 'inactive';
   limit?: number;
   offset?: number;
 }
