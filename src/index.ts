@@ -63,6 +63,41 @@ export type { CheckoutWebhookEvent, WebhookPayload } from './webhook.js';
 
 export { toAtomic, fromAtomic, toAtomicUSDC, fromAtomicUSDC } from './amount.js';
 
+// x402 — 호출당 과금 레인. 머천트(미들웨어)와 payer(서명 헬퍼) 양쪽을 한 패키지에서 제공한다.
+export {
+  x402,
+  X402Gate,
+  createMemoryReplayStore,
+  decodePaymentHeader,
+  encodePaymentHeader,
+  X402_PAYMENT_HEADER,
+  X402_PAYMENT_RESPONSE_HEADER,
+} from './x402.js';
+export type {
+  X402MiddlewareOptions,
+  X402GateOptions,
+  X402GateResult,
+  X402SettledPayment,
+  X402ReplayStore,
+  X402ClaimState,
+  X402Requirements,
+  X402Accept,
+  X402FeeBreakdown,
+  X402PaymentPayload,
+  Eip3009Authorization,
+  X402Request,
+  X402Response,
+} from './x402.js';
+
+export { createX402Payment, splitSignature, TRANSFER_WITH_AUTHORIZATION_TYPES } from './x402-pay.js';
+export type {
+  CreateX402PaymentOptions,
+  X402PaymentResult,
+  X402Signer,
+  X402TypedDataRequest,
+  Eip712Domain,
+} from './x402-pay.js';
+
 
 // 편의 팩토리
 import { BitPalCheckoutClient } from './client.js';

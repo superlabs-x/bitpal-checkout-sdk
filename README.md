@@ -192,6 +192,72 @@ BitPal may still deliver the **same event more than once** within the window. De
 is not signed, so it is forgeable). Persist the dedup key in the **same transaction** as your side
 effect; handlers must be safe to run twice (UPSERT, not INSERT).
 
+## x402 — charge per API call
+
+A different lane from checkout: no page, no redirect, no deposit address. The caller pays with a
+signed authorization and retries the request. Settles to the **same payout wallet as checkout**
+(register one in the console first).
+
+### Merchant side
+
+```ts
+import { x402 } from '@bitpal/checkout';
+
+// $1.00 USDC per call
+app.get('/report', x402({
+  apiKey: process.env.BITPAL_API_KEY,   // bp_test_… or bp_live_…
+  payTo: '0xYourPayoutWallet',
+  network: 'base',                      // test key → 'base-sepolia'
+  amount: '1000000',                    // atomic (USDC, 6dp) — your gross; the fee comes out of it
+}), (req, res) => {
+  res.json({ report: '…' });            // req.x402Payment has the txHash
+});
+```
+
+Unpaid requests get a `402` with the payment terms. Paid ones run `verify` → `settle` and reach your
+handler with `X-PAYMENT-RESPONSE` set. The middleware also does what the API cannot do for you:
+
+- **One payment unlocks one response.** `/settle` is idempotent, so replaying the same `X-PAYMENT`
+  keeps returning success — which would let one payment buy unlimited calls. The middleware records
+  redeemed authorizations and rejects reuse with `409`. The default store is **process memory**; on
+  multiple instances pass a shared `replayStore` (Redis/DB) or each instance grants its own response.
+- **Never turns an unconfirmed settlement into a fresh 402.** If settlement is uncertain it answers
+  `503` and asks for a retry with the *same* header — a new `402` would make the caller re-sign and
+  pay twice.
+
+Not on Express? `X402Gate` is the framework-neutral core — give it the header and the resource URL,
+it tells you whether to bill or serve.
+
+### Payer side
+
+The fee split needs two authorizations, which a stock x402 client does not know about.
+`createX402Payment` reads the `402` and builds both. You supply the signer; the SDK has no crypto
+dependency.
+
+```ts
+import { createX402Payment } from '@bitpal/checkout';
+
+const res = await fetch(url);
+if (res.status === 402) {
+  const { header } = await createX402Payment({
+    requirements: await res.json(),
+    from: account.address,
+    signTypedData: (req) => walletClient.signTypedData({ account, ...req }), // viem
+  });
+  const paid = await fetch(url, { headers: { 'X-PAYMENT': header } });
+}
+```
+
+### Supported
+
+| Network | Token | `network` |
+|---|---|---|
+| Base | USDC | `base` |
+| Base Sepolia | USDC | `base-sepolia` |
+
+EOA signers only — smart-contract wallets cannot sign EIP-3009 authorizations. Amounts are exact:
+over- and underpayment are both rejected, and this lane has no refund path.
+
 ## Config options
 
 ```ts
