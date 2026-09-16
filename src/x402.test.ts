@@ -156,10 +156,47 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
     const g = gate();
     const header = encodePaymentHeader(payload());
 
-    expect((await g.collect({ header, resource: RESOURCE })).kind).toBe('settled');
+    const first = await g.collect({ header, resource: RESOURCE });
+    expect(first.kind).toBe('settled');
+    if (first.kind !== 'settled') throw new Error('unreachable');
+    await first.commit(); // 응답을 실제로 내준 시점 = 소진 확정
+
     const second = await g.collect({ header, resource: RESOURCE });
     expect(second.kind).toBe('already_used');
     expect(second.status).toBe(409);
+  });
+
+  it('응답을 못 내주고 release 하면 같은 헤더로 다시 받을 수 있다', async () => {
+    // 핸들러가 throw 한 경우. 결제는 됐는데 리소스를 못 줬으니 409 로 막으면 안 된다.
+    stubFetch({
+      '/v1/x402/requirements': [REQUIREMENTS_OK],
+      '/v1/x402/verify': [VERIFY_OK],
+      '/v1/x402/settle': [SETTLE_OK],
+    });
+    const g = gate();
+    const header = encodePaymentHeader(payload());
+
+    const first = await g.collect({ header, resource: RESOURCE });
+    if (first.kind !== 'settled') throw new Error('unreachable');
+    await first.release();
+
+    const retry = await g.collect({ header, resource: RESOURCE });
+    expect(retry.kind).toBe('settled');
+  });
+
+  it('commit 전(= 처리 중)에 같은 결제가 또 오면 리소스를 내주지 않는다', async () => {
+    stubFetch({
+      '/v1/x402/requirements': [REQUIREMENTS_OK],
+      '/v1/x402/verify': [VERIFY_OK],
+      '/v1/x402/settle': [SETTLE_OK],
+    });
+    const g = gate();
+    const header = encodePaymentHeader(payload());
+
+    const first = await g.collect({ header, resource: RESOURCE });
+    expect(first.kind).toBe('settled');
+    const concurrent = await g.collect({ header, resource: RESOURCE });
+    expect(concurrent.kind).toBe('unconfirmed');
   });
 
   it('nonce 가 다르면 별개 결제로 통과한다', async () => {
@@ -218,7 +255,27 @@ describe('x402 게이트 — 실패 매핑', () => {
     });
     const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
-    expect(r.kind === 'payment_required' && r.body.error).toContain('reverted');
+    expect(r.kind === 'payment_required' && r.body.error).toBe('PAYMENT_REVERTED');
+  });
+
+  it('settle 200 + 미확정 상태(submitted 등)는 402 가 아니라 503 — 재서명은 이중 지불이다', async () => {
+    // 자금이 이미 움직였을 수 있는 상태다. 여기서 402 를 주면 payer 가 새 authorization 에
+    // 서명해 두 번 낸다. reverted/expired/failed 만 재서명 대상이다.
+    for (const status of ['created', 'submitted', 'unknown', 'reconciliation_needed']) {
+      stubFetch({
+        '/v1/x402/requirements': [REQUIREMENTS_OK],
+        '/v1/x402/verify': [VERIFY_OK],
+        '/v1/x402/settle': [
+          {
+            status: 200,
+            body: { data: { success: true, payment_id: 'pay_1', status, tx_hash: null, network: 'base' } },
+          },
+        ],
+      });
+      const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+      expect(r.kind, `status=${status}`).toBe('unconfirmed');
+      expect(r.status).toBe(503);
+    }
   });
 
   it('요청 검증 — payTo/amount 형식이 틀리면 생성 시점에 막는다', () => {
@@ -236,6 +293,29 @@ describe('헤더 인코딩 / replay store', () => {
   it('평문 JSON 헤더도 받아준다', () => {
     const p = payload();
     expect(decodePaymentHeader(JSON.stringify(p))).toEqual(p);
+  });
+
+  it('형태가 틀린 헤더는 거부한다 (인증 전 외부 입력)', () => {
+    const bad = (mut: (p: X402PaymentPayload) => void) => {
+      const p = payload();
+      mut(p);
+      return () => decodePaymentHeader(JSON.stringify(p));
+    };
+    expect(bad(p => { p.payload.merchant.from = 'nope'; })).toThrow(/merchant.from/);
+    expect(bad(p => { p.payload.merchant.value = '-1'; })).toThrow(/merchant.value/);
+    expect(bad(p => { p.payload.merchant.nonce = '0x1234'; })).toThrow(/merchant.nonce/);
+    expect(bad(p => { (p as { x402Version: number }).x402Version = 2; })).toThrow(/x402Version/);
+    expect(() => decodePaymentHeader('x'.repeat(9000))).toThrow(/too large/);
+  });
+
+  it('검증된 필드만 통과시킨다 — 임의 키가 API 바디로 새지 않는다', () => {
+    const p = payload() as unknown as Record<string, unknown>;
+    (p.payload as { merchant: Record<string, unknown> }).merchant.__proto__x = 'evil';
+    (p.payload as { merchant: Record<string, unknown> }).merchant.extra = 'junk';
+    const decoded = decodePaymentHeader(JSON.stringify(p));
+    expect(Object.keys(decoded.payload.merchant).sort()).toEqual(
+      ['from', 'nonce', 'signature', 'to', 'validAfter', 'validBefore', 'value'],
+    );
   });
 
   it('memory store — claim 은 한 번만 ok, commit 후엔 used', async () => {

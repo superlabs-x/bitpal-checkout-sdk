@@ -85,7 +85,14 @@ export interface X402PaymentResult {
   totalAmount: string;
 }
 
-const MIN_VALIDITY_SECONDS = 60;
+/**
+ * 서버가 요구하는 범위는 60~3600초지만, payer 는 **로컬 시계**로 validBefore 를 만든다.
+ * 60 에 딱 맞추면 네트워크 왕복 + 서버 시계가 1초만 앞서도 `validBefore >= now+60` 에서 거부되므로
+ * 서명 낭비를 막기 위해 마진을 둔 하한을 쓴다.
+ */
+const CLOCK_SKEW_MARGIN_SECONDS = 30;
+const SERVER_MIN_VALIDITY_SECONDS = 60;
+const MIN_VALIDITY_SECONDS = SERVER_MIN_VALIDITY_SECONDS + CLOCK_SKEW_MARGIN_SECONDS;
 const MAX_VALIDITY_SECONDS = 3600;
 
 /**
@@ -115,7 +122,8 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
 
   if (validFor < MIN_VALIDITY_SECONDS || validFor > MAX_VALIDITY_SECONDS) {
     throw new Error(
-      `[BitPal] x402: validForSeconds must be between ${MIN_VALIDITY_SECONDS} and ${MAX_VALIDITY_SECONDS} (got ${validFor}).`,
+      `[BitPal] x402: validForSeconds must be between ${MIN_VALIDITY_SECONDS} and ${MAX_VALIDITY_SECONDS} (got ${validFor}). ` +
+        `The server requires ${SERVER_MIN_VALIDITY_SECONDS}s minimum; the extra ${CLOCK_SKEW_MARGIN_SECONDS}s absorbs clock skew and round-trip latency.`,
     );
   }
 
@@ -222,18 +230,36 @@ async function signAuthorization(args: {
   return { ...message, signature: splitSignature(signature) };
 }
 
-/** 65바이트 서명 → `{v, r, s}`. BitPal API 가 요구하는 분해 형태. */
+/**
+ * 서명 → `{v, r, s}`. BitPal API 가 요구하는 분해 형태.
+ *
+ * 65바이트(r‖s‖v)와 64바이트 EIP-2098 compact(r‖yParityAndS) 둘 다 받는다 — viem 의
+ * `signTypedData` 는 65바이트를 주지만 일부 지갑·라이브러리는 compact 를 돌려준다.
+ */
 export function splitSignature(signature: string): { v: number; r: string; s: string } {
   const hex = signature.startsWith('0x') ? signature.slice(2) : signature;
-  if (hex.length !== 130 || !/^[0-9a-fA-F]+$/.test(hex)) {
-    throw new Error(`[BitPal] x402: expected a 65-byte hex signature, got ${signature.length} chars.`);
+  if (!/^[0-9a-fA-F]+$/.test(hex) || (hex.length !== 130 && hex.length !== 128)) {
+    throw new Error(
+      `[BitPal] x402: expected a 65-byte or 64-byte (EIP-2098) hex signature, got ${signature.length} chars.`,
+    );
   }
   const r = `0x${hex.slice(0, 64)}`;
+
+  if (hex.length === 128) {
+    // EIP-2098: s 의 최상위 비트가 yParity. 그 비트를 떼어내야 정상 s 가 된다.
+    const yParityAndS = BigInt(`0x${hex.slice(64, 128)}`);
+    const yParity = Number((yParityAndS >> 255n) & 1n);
+    const s = yParityAndS & ((1n << 255n) - 1n);
+    return { v: 27 + yParity, r, s: `0x${s.toString(16).padStart(64, '0')}` };
+  }
+
   const s = `0x${hex.slice(64, 128)}`;
-  let v = parseInt(hex.slice(128, 130), 16);
+  const raw = parseInt(hex.slice(128, 130), 16);
   // 지갑에 따라 v 를 0/1 로 준다 — 온체인 ecrecover 규약인 27/28 로 맞춘다.
-  if (v < 27) v += 27;
-  return { v, r, s };
+  //   그 외 값은 서버로 보내봐야 recover 가 어긋나므로 여기서 끊는다.
+  if (raw === 27 || raw === 28) return { v: raw, r, s };
+  if (raw === 0 || raw === 1) return { v: raw + 27, r, s };
+  throw new Error(`[BitPal] x402: unexpected signature v=${raw} (expected 0, 1, 27 or 28).`);
 }
 
 /** CSPRNG 32바이트 nonce. EIP-3009 는 nonce 가 서명자별로 유일하기만 하면 된다. */

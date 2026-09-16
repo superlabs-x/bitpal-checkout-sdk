@@ -219,14 +219,26 @@ handler with `X-PAYMENT-RESPONSE` set. The middleware also does what the API can
 
 - **One payment unlocks one response.** `/settle` is idempotent, so replaying the same `X-PAYMENT`
   keeps returning success — which would let one payment buy unlimited calls. The middleware records
-  redeemed authorizations and rejects reuse with `409`. The default store is **process memory**; on
-  multiple instances pass a shared `replayStore` (Redis/DB) or each instance grants its own response.
-- **Never turns an unconfirmed settlement into a fresh 402.** If settlement is uncertain it answers
-  `503` and asks for a retry with the *same* header — a new `402` would make the caller re-sign and
-  pay twice.
+  redeemed authorizations and rejects reuse with `409`. Redemption is recorded only once your
+  response actually ships: if the handler throws, the caller can retry with the same header instead
+  of paying for nothing.
+- **Only re-prompts for payment when the money definitely did not move.** `reverted`, `expired` and
+  `failed` get a fresh `402`. Everything else — settlement still in flight, an uncertain broadcast, a
+  timeout — answers `503` and asks for a retry with the *same* header. Handing back a `402` there
+  would make the caller re-sign and pay twice.
 
 Not on Express? `X402Gate` is the framework-neutral core — give it the header and the resource URL,
-it tells you whether to bill or serve.
+it tells you whether to bill or serve. On a `settled` result, call `commit()` once you have delivered
+the response, or `release()` if you could not.
+
+**Two things to set for production:**
+
+- `replayStore` — the default keeps redeemed payments in process memory, so a second instance does
+  not know what the first one served. Pass a shared store (Redis/DB) whose `claim` is an atomic
+  compare-and-set. The memory store also refuses new payments rather than evicting live entries once
+  it fills, so a busy single instance needs a real store too.
+- `resource` — by default it is derived from the request's `Host` header, which the caller controls.
+  The payment binds to that string, so pass an explicit `resource` (or a function) to pin it.
 
 ### Payer side
 
@@ -256,7 +268,8 @@ if (res.status === 402) {
 | Base Sepolia | USDC | `base-sepolia` |
 
 EOA signers only — smart-contract wallets cannot sign EIP-3009 authorizations. Amounts are exact:
-over- and underpayment are both rejected, and this lane has no refund path.
+over- and underpayment are both rejected, and this lane has no refund path. Authorizations are valid
+for 90–3600 seconds (the server's floor is 60s; the extra 30s absorbs clock skew and round trips).
 
 ## Config options
 

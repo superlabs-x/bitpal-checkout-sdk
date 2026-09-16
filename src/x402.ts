@@ -26,14 +26,26 @@ export const X402_PAYMENT_HEADER = 'x-payment';
 /** resource server → payer. base64(JSON) 정산 결과(txHash 포함). */
 export const X402_PAYMENT_RESPONSE_HEADER = 'X-PAYMENT-RESPONSE';
 
+/**
+ * settle 이 200 으로 돌려준 상태 중 **자금이 움직이지 않았음이 확정된** 것들.
+ * 이때만 402(재서명 요구)를 준다. 나머지(created/submitted/unknown/reconciliation_needed)는
+ * 아직 확정이 안 된 상태라 재서명시키면 이중 지불이 된다.
+ */
+const RESIGN_REQUIRED_STATUSES = new Set(['reverted', 'expired', 'failed']);
+
 const DEFAULT_BASE_URL = 'https://api.bitpal.io';
 const DEFAULT_TIMEOUT = 60_000;
 /** 402 의 기본 유효시간(초) — 서버 기본값과 동일. inflight 점유 TTL 로도 쓴다. */
 const DEFAULT_MAX_TIMEOUT_SECONDS = 300;
+/** 서버가 authorization 유효창에 요구하는 범위. 벗어나면 verify 에서 거부된다. */
+const MIN_VALIDITY_SECONDS = 60;
+const MAX_VALIDITY_SECONDS = 3600;
 /** 사용 완료된 nonce 를 기억하는 기간(초). EIP-3009 유효창을 크게 넘기면 재사용 위험이 없다. */
 const CONSUMED_TTL_SECONDS = 24 * 60 * 60;
-/** 기본 in-memory store 상한 — 넘으면 오래된 것부터 버린다. */
+/** 기본 in-memory store 상한. 넘으면 새 결제를 거절한다(재사용 차단을 포기하지 않는다). */
 const MEMORY_STORE_MAX_ENTRIES = 50_000;
+/** X-PAYMENT 헤더 상한. 정상 payload 는 authorization 2건이라 1KB 안쪽이다. */
+const MAX_PAYMENT_HEADER_BYTES = 8192;
 
 /* ─── 402 바디 타입(서버가 만들어 주는 값) ─── */
 
@@ -117,11 +129,14 @@ export function createMemoryReplayStore(): X402ReplayStore {
     for (const [k, v] of entries) {
       if (v.expiresAt <= now) entries.delete(k);
     }
-    // 만료만으로 안 줄어들면 삽입 순서대로 버린다(Map 은 삽입 순서 보장).
-    while (entries.size > MEMORY_STORE_MAX_ENTRIES) {
-      const oldest = entries.keys().next();
-      if (oldest.done) break;
-      entries.delete(oldest.value);
+    if (entries.size <= MEMORY_STORE_MAX_ENTRIES) return;
+
+    // 만료로 안 줄어들면 inflight 만 버린다(짧게 살고, 버려도 재시도로 복구된다).
+    //   **만료 전 'used' 는 절대 버리지 않는다** — 버리는 순간 그 authorization 이 다시 'ok' 가 되고,
+    //   /settle 은 멱등이라 confirmed 200 을 돌려주므로 결제 1건으로 리소스를 두 번 받는다.
+    for (const [k, v] of entries) {
+      if (entries.size <= MEMORY_STORE_MAX_ENTRIES) break;
+      if (v.state === 'inflight') entries.delete(k);
     }
   };
 
@@ -131,6 +146,15 @@ export function createMemoryReplayStore(): X402ReplayStore {
       prune(now);
       const found = entries.get(key);
       if (found) return found.state;
+      if (entries.size >= MEMORY_STORE_MAX_ENTRIES) {
+        // 여기서 그냥 받아주면 위 prune 이 만료 전 'used' 를 버려야 하고, 그건 재사용 차단이
+        //   뚫린다는 뜻이다. 차단을 포기하느니 새 결제를 거절한다(fail-closed).
+        //   이 한계에 닿는 트래픽이면 공유 store 를 붙여야 한다 — README 참고.
+        throw new BitPalError(
+          '[BitPal] x402: replay store is full. Pass a shared replayStore (Redis/DB) for this traffic level.',
+          503,
+        );
+      }
       entries.set(key, { state: 'inflight', expiresAt: now + inflightTtlSeconds * 1000 });
       return 'ok';
     },
@@ -170,10 +194,14 @@ export interface X402GateOptions {
 export interface X402SettledPayment {
   paymentId: string;
   txHash: string | null;
+  /** 플랫폼 수수료 leg 의 tx. best-effort 라 merchant leg 가 확정돼도 null 일 수 있다. */
+  feeTxHash: string | null;
   network: string;
   /** payer 주소(merchant authorization 의 from). */
   payer: string;
   amount: string;
+  /** 이미 정산돼 있던 건을 그대로 돌려받았는지(감사·디버깅용). */
+  idempotent: boolean;
 }
 
 export type X402GateResult =
@@ -183,8 +211,21 @@ export type X402GateResult =
   | { kind: 'already_used'; status: 409; body: { error: string; message: string } }
   /** 자금이 움직였는지 아직 확정 못 했다 — **같은** `X-PAYMENT` 로 재시도해야 한다(재서명 금지). */
   | { kind: 'unconfirmed'; status: 503; body: { error: string; message: string; paymentId?: string } }
-  /** 정산 확정 — 리소스를 내주면 된다. */
-  | { kind: 'settled'; status: 200; payment: X402SettledPayment; paymentResponseHeader: string };
+  /**
+   * 정산 확정 — 리소스를 내주면 된다.
+   *
+   * 이 시점에 결제는 아직 **점유(inflight)** 상태다. 응답을 실제로 내보낸 뒤 `commit()` 을,
+   * 핸들러가 실패해 리소스를 못 줬으면 `release()` 를 불러야 한다. 둘 다 안 부르면 점유가
+   * TTL 까지 유지돼 그 사이 재시도가 503 으로 막힌다(이중 지급보다 안전한 방향).
+   */
+  | {
+      kind: 'settled';
+      status: 200;
+      payment: X402SettledPayment;
+      paymentResponseHeader: string;
+      commit: () => Promise<void>;
+      release: () => Promise<void>;
+    };
 
 /**
  * 프레임워크에 묶이지 않은 x402 게이트.
@@ -206,6 +247,14 @@ export class X402Gate {
     }
     if (!/^\d+$/.test(opts.amount)) {
       throw new Error('[BitPal] x402: amount must be an atomic integer string (USDC 6dp, $1 = "1000000").');
+    }
+    const timeoutSeconds = opts.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS;
+    if (timeoutSeconds < MIN_VALIDITY_SECONDS || timeoutSeconds > MAX_VALIDITY_SECONDS) {
+      // 서버가 이 범위 밖 authorization 을 거부하므로, 여기서 막지 않으면 402 를 내려놓고
+      //   payer 가 그대로 서명한 뒤 verify 에서 전부 튕긴다.
+      throw new Error(
+        `[BitPal] x402: maxTimeoutSeconds must be between ${MIN_VALIDITY_SECONDS} and ${MAX_VALIDITY_SECONDS} (got ${timeoutSeconds}).`,
+      );
     }
     this.opts = opts;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
@@ -314,7 +363,9 @@ export class X402Gate {
       payment_id: string;
       status: string;
       tx_hash: string | null;
+      fee_tx_hash?: string | null;
       network: string;
+      idempotent?: boolean;
     };
     try {
       settled = await this.request('POST', '/v1/x402/settle', body);
@@ -338,24 +389,39 @@ export class X402Gate {
       };
     }
 
-    // HTTP 200 이어도 종결 상태가 confirmed 가 아닐 수 있다(이미 reverted 로 끝난 건의 재요청 등).
+    // HTTP 200 이어도 confirmed 가 아닐 수 있다. 여기서 뭉뚱그려 402 를 주면, 자금이 이미 움직였을
+    //   수 있는 상태(submitted/unknown/...)에도 payer 가 새로 서명해 **이중 지불**한다. 그래서
+    //   "자금이 안 움직였음이 확정된 상태" 만 402 로 보내고, 나머지는 같은 헤더로 재시도시킨다.
     if (settled.status !== 'confirmed') {
       await this.store.release(key);
-      return this.paymentRequired(resource, `PAYMENT_NOT_CONFIRMED (${settled.status})`, accept);
+      if (RESIGN_REQUIRED_STATUSES.has(settled.status)) {
+        return this.paymentRequired(resource, `PAYMENT_${settled.status.toUpperCase()}`, accept);
+      }
+      return {
+        kind: 'unconfirmed',
+        status: 503,
+        body: {
+          error: 'SETTLEMENT_UNCONFIRMED',
+          message: `Payment is still settling (${settled.status}). Retry with the same X-PAYMENT header — do not create a new payment.`,
+          paymentId: settled.payment_id,
+        },
+      };
     }
 
-    await this.store.commit(key);
+    const payment: X402SettledPayment = {
+      paymentId: settled.payment_id,
+      txHash: settled.tx_hash,
+      feeTxHash: settled.fee_tx_hash ?? null,
+      network: settled.network,
+      payer: merchant.from,
+      amount: accept.maxAmountRequired,
+      idempotent: settled.idempotent ?? false,
+    };
 
     return {
       kind: 'settled',
       status: 200,
-      payment: {
-        paymentId: settled.payment_id,
-        txHash: settled.tx_hash,
-        network: settled.network,
-        payer: merchant.from,
-        amount: accept.maxAmountRequired,
-      },
+      payment,
       paymentResponseHeader: encodeBase64Json({
         success: true,
         transaction: settled.tx_hash,
@@ -363,6 +429,10 @@ export class X402Gate {
         payer: merchant.from,
         paymentId: settled.payment_id,
       }),
+      // 소진 확정은 **응답을 실제로 내준 뒤**다. 핸들러가 throw 하거나 프로세스가 죽으면 결제만 하고
+      //   리소스를 못 받는데, 그때 commit 되어 있으면 재시도가 409 로 막힌다.
+      commit: () => Promise.resolve(this.store.commit(key)),
+      release: () => Promise.resolve(this.store.release(key)),
     };
   }
 
@@ -440,6 +510,10 @@ export interface X402Response {
   status(code: number): X402Response;
   json(body: unknown): unknown;
   setHeader(name: string, value: string): unknown;
+  /** 응답이 실제로 나갔는지 보고 결제를 소진 처리한다. 없으면 즉시 소진 처리로 폴백. */
+  once?(event: string, listener: () => void): unknown;
+  statusCode?: number;
+  writableEnded?: boolean;
 }
 
 export interface X402MiddlewareOptions extends X402GateOptions {
@@ -491,6 +565,25 @@ export function x402(options: X402MiddlewareOptions) {
 
       res.setHeader(X402_PAYMENT_RESPONSE_HEADER, result.paymentResponseHeader);
       req.x402Payment = result.payment;
+
+      // 결제 소진은 **응답이 실제로 나간 뒤**에 확정한다. 핸들러가 throw 하거나 5xx 로 끝나면
+      //   payer 는 리소스를 못 받은 것이므로 점유를 풀어 같은 헤더로 재시도할 수 있게 한다
+      //   (/settle 이 멱등이라 재시도해도 자금은 한 번만 움직인다).
+      if (typeof res.once === 'function') {
+        let finalized = false;
+        const finalize = (delivered: boolean): void => {
+          if (finalized) return;
+          finalized = true;
+          const done = delivered ? result.commit() : result.release();
+          void done.catch(() => undefined);
+        };
+        res.once('finish', () => finalize((res.statusCode ?? 200) < 500));
+        res.once('close', () => finalize(res.writableEnded === true && (res.statusCode ?? 200) < 500));
+      } else {
+        // once 가 없는 런타임 — 전달 여부를 알 수 없으니 소진 처리한다(중복 지급보다 안전).
+        await result.commit();
+      }
+
       if (options.onSettled) await options.onSettled(result.payment, req);
       next();
     } catch (err) {
@@ -521,11 +614,77 @@ function resolveResource(req: X402Request, override: X402MiddlewareOptions['reso
   return `${protocol}://${host}${path}`;
 }
 
-/** base64(JSON) 이 표준이지만, 평문 JSON 을 보내는 클라이언트도 받아준다. */
+/**
+ * base64(JSON) 이 표준이지만, 평문 JSON 을 보내는 클라이언트도 받아준다.
+ *
+ * 인증 전에 임의의 외부 입력을 파싱하는 자리라 크기 상한과 형태 검증을 여기서 끝낸다 —
+ * 아래를 통과한 값만 replay key 와 BitPal API 바디로 들어간다. (프로토타입 오염은 이 payload 를
+ * 어디에도 merge 하지 않아 직접 경로는 없지만, `__proto__` 같은 키를 그대로 통과시키지 않는다.)
+ */
 export function decodePaymentHeader(header: string): X402PaymentPayload {
+  if (header.length > MAX_PAYMENT_HEADER_BYTES) {
+    throw new Error('[BitPal] x402: X-PAYMENT header too large.');
+  }
   const trimmed = header.trim();
-  if (trimmed.startsWith('{')) return JSON.parse(trimmed) as X402PaymentPayload;
-  return JSON.parse(decodeBase64(trimmed)) as X402PaymentPayload;
+  const json = trimmed.startsWith('{') ? trimmed : decodeBase64(trimmed);
+  const parsed: unknown = JSON.parse(json);
+  return assertPaymentPayload(parsed);
+}
+
+const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+const HEX32_RE = /^0x[a-fA-F0-9]{64}$/;
+const DECIMAL_RE = /^\d{1,78}$/;
+
+function assertPaymentPayload(value: unknown): X402PaymentPayload {
+  const root = asObject(value, 'payment payload');
+  if (root.x402Version !== 1) throw new Error('[BitPal] x402: unsupported x402Version.');
+  if (root.scheme !== 'exact') throw new Error('[BitPal] x402: unsupported scheme.');
+  if (typeof root.network !== 'string' || root.network.length === 0 || root.network.length > 64) {
+    throw new Error('[BitPal] x402: invalid network.');
+  }
+  const inner = asObject(root.payload, 'payload');
+  const merchant = assertAuthorization(inner.merchant, 'merchant');
+  const fee = inner.fee === undefined ? undefined : assertAuthorization(inner.fee, 'fee');
+  return {
+    x402Version: 1,
+    scheme: 'exact',
+    network: root.network,
+    payload: fee ? { merchant, fee } : { merchant },
+  };
+}
+
+function assertAuthorization(value: unknown, label: string): Eip3009Authorization {
+  const a = asObject(value, `${label} authorization`);
+  const sig = asObject(a.signature, `${label} signature`);
+  const check = (ok: boolean, field: string): void => {
+    if (!ok) throw new Error(`[BitPal] x402: invalid ${label}.${field}.`);
+  };
+  check(typeof a.from === 'string' && ADDRESS_RE.test(a.from), 'from');
+  check(typeof a.to === 'string' && ADDRESS_RE.test(a.to), 'to');
+  check(typeof a.value === 'string' && DECIMAL_RE.test(a.value), 'value');
+  check(typeof a.validAfter === 'string' && DECIMAL_RE.test(a.validAfter), 'validAfter');
+  check(typeof a.validBefore === 'string' && DECIMAL_RE.test(a.validBefore), 'validBefore');
+  check(typeof a.nonce === 'string' && HEX32_RE.test(a.nonce), 'nonce');
+  check(typeof sig.v === 'number' && Number.isInteger(sig.v), 'signature.v');
+  check(typeof sig.r === 'string' && HEX32_RE.test(sig.r), 'signature.r');
+  check(typeof sig.s === 'string' && HEX32_RE.test(sig.s), 'signature.s');
+  // 검증된 필드만 복사한다 — 원본 객체를 그대로 넘기면 임의 키가 API 바디까지 따라간다.
+  return {
+    from: a.from as string,
+    to: a.to as string,
+    value: a.value as string,
+    validAfter: a.validAfter as string,
+    validBefore: a.validBefore as string,
+    nonce: a.nonce as string,
+    signature: { v: sig.v as number, r: sig.r as string, s: sig.s as string },
+  };
+}
+
+function asObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`[BitPal] x402: ${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
 }
 
 /** payer 헬퍼가 만든 payload 를 `X-PAYMENT` 헤더 값으로 인코딩한다. */

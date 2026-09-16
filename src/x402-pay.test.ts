@@ -123,13 +123,16 @@ describe('createX402Payment', () => {
     expect(p.payload.merchant.value).toBe('1000000');
   });
 
-  it('유효시간이 서버 허용 범위(60~3600초) 밖이면 서명 전에 막는다', async () => {
+  it('유효시간이 허용 범위 밖이면 서명 전에 막는다 (서버 60초 + 시계오차 마진 30초)', async () => {
+    // 서버 하한 60 에 딱 붙이면 왕복 지연·시계 오차로 verify 에서 튕긴다 — 서명을 낭비시키지 않는다.
+    for (const bad of [10, 60, 89, 7200]) {
+      await expect(
+        createX402Payment({ requirements: ACCEPT, from: FROM, signTypedData: recorder().sign, validForSeconds: bad }),
+      ).rejects.toThrow(/between 90 and 3600/);
+    }
     await expect(
-      createX402Payment({ requirements: ACCEPT, from: FROM, signTypedData: recorder().sign, validForSeconds: 10 }),
-    ).rejects.toThrow(/between 60 and 3600/);
-    await expect(
-      createX402Payment({ requirements: ACCEPT, from: FROM, signTypedData: recorder().sign, validForSeconds: 7200 }),
-    ).rejects.toThrow(/between 60 and 3600/);
+      createX402Payment({ requirements: ACCEPT, from: FROM, signTypedData: recorder().sign, validForSeconds: 90, randomNonce: nonce }),
+    ).resolves.toBeDefined();
   });
 
   it('chainId 가 없는 402 는 domain 을 만들 수 없으므로 거부한다', async () => {
@@ -157,7 +160,20 @@ describe('splitSignature', () => {
     expect(splitSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}01`).v).toBe(28);
   });
 
-  it('길이가 안 맞으면 throw', () => {
-    expect(() => splitSignature('0xdeadbeef')).toThrow(/65-byte/);
+  it('EIP-2098 compact(64바이트) 서명도 받는다', () => {
+    // yParityAndS 의 최상위 비트가 yParity. 그 비트를 떼어야 정상 s 가 된다.
+    const s = '2'.repeat(64);
+    const compactEven = `0x${'1'.repeat(64)}${s}`;
+    expect(splitSignature(compactEven)).toEqual({ v: 27, r: `0x${'1'.repeat(64)}`, s: `0x${s}` });
+
+    // 최상위 비트를 세운 경우 → v=28, s 는 비트를 뗀 값
+    const high = (BigInt(`0x${s}`) | (1n << 255n)).toString(16).padStart(64, '0');
+    expect(splitSignature(`0x${'1'.repeat(64)}${high}`)).toEqual({ v: 28, r: `0x${'1'.repeat(64)}`, s: `0x${s}` });
+  });
+
+  it('길이가 안 맞거나 v 가 규약 밖이면 throw', () => {
+    expect(() => splitSignature('0xdeadbeef')).toThrow(/65-byte or 64-byte/);
+    // v=2 같은 값을 27+2=29 로 만들어 서버로 보내면 recover 가 어긋난다 — 여기서 끊는다.
+    expect(() => splitSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}02`)).toThrow(/unexpected signature v=2/);
   });
 });
