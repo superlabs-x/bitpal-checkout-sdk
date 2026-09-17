@@ -15,6 +15,11 @@ export const CHECKOUT_WEBHOOK_EVENTS = [
   'checkout.session.expired',
   'checkout.session.unresolved',
   'checkout.refund.recorded',
+  // x402 결제의 **사후** 확정. 정상 경로(/settle 이 그 자리에서 결과를 반환)는 발행되지 않는다 —
+  //   이미 아는 결과를 중복으로 받지 않게 하기 위함이다. /settle 이 503 을 반환해 결과를 모른 채
+  //   남았을 때, reconciler 가 체인을 보고 종결시키면 이 이벤트가 온다.
+  //   payload: { payment_id, status: 'confirmed'|'reverted'|'expired', tx_hash, resource, amount, … }
+  'x402.payment.resolved',
 ] as const;
 
 export type CheckoutWebhookEvent = (typeof CHECKOUT_WEBHOOK_EVENTS)[number];

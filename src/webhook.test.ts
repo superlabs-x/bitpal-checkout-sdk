@@ -31,13 +31,15 @@ function signCanonical(body: string, secret: string, timestamp: string): string 
 const freshTs = () => new Date().toISOString();
 
 describe('@bitpal/checkout — CHECKOUT_WEBHOOK_EVENTS canonical names', () => {
-  it('all events use checkout. prefix (matches backend)', () => {
+  it('이벤트 이름은 <레인>.<자원>.<동작> 꼴이다', () => {
+    // 이전에는 'checkout.' 접두사를 강제했는데, x402 가 붙으면서 레인이 둘이 됐다.
+    // 형태는 그대로 유지한다 — 레인 이름이 맨 앞에 오고 점으로 구분한다.
     for (const evt of CHECKOUT_WEBHOOK_EVENTS) {
-      expect(evt.startsWith('checkout.')).toBe(true);
+      expect(evt).toMatch(/^(checkout|x402)\.[a-z_]+\.[a-z_]+$/);
     }
   });
 
-  it('안2 이벤트 7종 정확 일치 (backend checkout-webhook.ts 와 drift 없음)', () => {
+  it('이벤트 8종 정확 일치 (backend checkout-webhook.ts 와 drift 없음)', () => {
     expect([...CHECKOUT_WEBHOOK_EVENTS].sort()).toEqual([
       'checkout.refund.recorded',
       'checkout.session.created',
@@ -46,6 +48,8 @@ describe('@bitpal/checkout — CHECKOUT_WEBHOOK_EVENTS canonical names', () => {
       'checkout.session.paid',
       'checkout.session.settled',
       'checkout.session.unresolved',
+      // x402 사후 확정만. 정상 경로(/settle 응답)는 발행되지 않는다.
+      'x402.payment.resolved',
     ]);
   });
 
