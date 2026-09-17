@@ -148,6 +148,9 @@ describe('x402 게이트 — 정상 정산', () => {
     expect(verify.body.paymentRequirements).toEqual({
       asset: ASSET,
       payTo: PAY_TO,
+      // 머천트 정산 지갑 — facilitator 가 이 값으로 payTo(정산 주소)를 재계산해 대조한다.
+      //   CREATE2 는 단방향이라 payTo 에서 되돌릴 수 없어 따로 보내야 한다.
+      merchant: PAY_TO,
       maxAmountRequired: '1000000',
       resource: RESOURCE,
     });

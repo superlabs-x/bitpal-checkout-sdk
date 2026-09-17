@@ -363,7 +363,12 @@ export class X402Gate {
       },
       paymentRequirements: {
         asset: accept.asset,
+        // payer 가 서명한 목적지 = 분배 조건을 커밋한 정산 주소.
         payTo: accept.payTo,
+        // 머천트 정산 지갑. facilitator 가 이 값으로 정산 주소를 재계산해 payTo 와 대조한다 —
+        //   CREATE2 는 단방향이라 payTo 에서 되돌릴 수 없으므로 따로 보내야 한다.
+        //   우리 설정값을 그대로 쓴다(402 응답에서 읽지 않는다 — 그러면 재계산의 의미가 없다).
+        merchant: this.opts.payTo,
         maxAmountRequired: accept.maxAmountRequired,
         resource: accept.resource,
       },
