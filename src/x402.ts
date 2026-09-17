@@ -174,8 +174,14 @@ export interface X402GateOptions {
   apiKey: string;
   /** 정산 지갑. 콘솔에 등록한 payout 주소와 같은 값이어야 한다. */
   payTo: string;
-  /** 호출 1건당 받을 총액(atomic). USDC 6dp 기준 $1 = `'1000000'`. 수수료는 여기서 차감된다. */
-  amount: string;
+  /**
+   * 호출 1건당 받을 총액. **사람 표기 문자열**이다 — `'0.1'`, `'1'`, `'29.00'`.
+   * 체인·토큰 decimals 를 계산할 필요가 없다(체크아웃 `line_items[].amount` 와 같은 모델).
+   * 수수료는 이 금액에서 차감된다. raw atomic 을 직접 넣으려면 `amountAtomic` 을 쓴다(상호 배타).
+   */
+  amount?: string;
+  /** raw atomic 정수 문자열(고급). USDC 6dp 기준 $1 = `'1000000'`. `amount` 와 상호 배타. */
+  amountAtomic?: string;
   /** 생략 시 API 키 모드의 기본 자산(현재 Base / Base Sepolia). */
   network?: string;
   /** 기본 `'USDC'`. */
@@ -245,8 +251,16 @@ export class X402Gate {
     if (!/^0x[a-fA-F0-9]{40}$/.test(opts.payTo)) {
       throw new Error('[BitPal] x402: payTo must be a 0x EVM address (your registered payout wallet).');
     }
-    if (!/^\d+$/.test(opts.amount)) {
-      throw new Error('[BitPal] x402: amount must be an atomic integer string (USDC 6dp, $1 = "1000000").');
+    const hasHuman = opts.amount != null;
+    const hasAtomic = opts.amountAtomic != null;
+    if (hasHuman === hasAtomic) {
+      throw new Error('[BitPal] x402: provide exactly one of `amount` ("0.1") or `amountAtomic` ("100000").');
+    }
+    if (hasHuman && !/^(0|[1-9]\d*)(\.\d{1,6})?$/.test(opts.amount as string)) {
+      throw new Error('[BitPal] x402: amount must be a decimal string like "0.1" or "29" (max 6 decimals).');
+    }
+    if (hasAtomic && !/^\d+$/.test(opts.amountAtomic as string)) {
+      throw new Error('[BitPal] x402: amountAtomic must be an integer string (USDC 6dp, $1 = "1000000").');
     }
     const timeoutSeconds = opts.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS;
     if (timeoutSeconds < MIN_VALIDITY_SECONDS || timeoutSeconds > MAX_VALIDITY_SECONDS) {
@@ -267,7 +281,8 @@ export class X402Gate {
   async requirements(resource: string): Promise<X402Requirements> {
     return this.request<X402Requirements>('POST', '/v1/x402/requirements', {
       payTo: this.opts.payTo,
-      amount: this.opts.amount,
+      // 사람 표기 → atomic 변환은 **서버가** 한다. SDK 가 decimals 를 알 필요가 없다.
+      ...(this.opts.amount != null ? { amount: this.opts.amount } : { amountAtomic: this.opts.amountAtomic }),
       resource,
       ...(this.opts.network ? { network: this.opts.network } : {}),
       ...(this.opts.asset ? { asset: this.opts.asset } : {}),

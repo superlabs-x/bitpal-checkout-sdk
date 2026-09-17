@@ -64,7 +64,7 @@ function gate(overrides: Partial<ConstructorParameters<typeof X402Gate>[0]> = {}
   return new X402Gate({
     apiKey: 'bp_test_1',
     payTo: PAY_TO,
-    amount: '1000000',
+    amount: '1',
     baseUrl: 'http://api.test',
     ...overrides,
   });
@@ -278,9 +278,34 @@ describe('x402 게이트 — 실패 매핑', () => {
     }
   });
 
-  it('요청 검증 — payTo/amount 형식이 틀리면 생성 시점에 막는다', () => {
+  it('요청 검증 — payTo 형식이 틀리면 생성 시점에 막는다', () => {
     expect(() => gate({ payTo: 'not-an-address' })).toThrow(/payTo/);
-    expect(() => gate({ amount: '1.5' })).toThrow(/atomic/);
+  });
+
+  it('금액은 사람 표기 amount XOR raw amountAtomic 이다', () => {
+    // 체크아웃 line item / Price 와 같은 모델 — 머천트가 decimals 를 계산하지 않는다.
+    expect(() => gate({ amount: undefined })).toThrow(/exactly one/);
+    expect(() => gate({ amount: '1', amountAtomic: '1000000' })).toThrow(/exactly one/);
+    expect(() => gate({ amount: '0.0000001' })).toThrow(/decimal string/);
+    expect(() => gate({ amount: undefined, amountAtomic: '1.5' })).toThrow(/integer string/);
+    expect(() => gate({ amount: '0.1' })).not.toThrow();
+    expect(() => gate({ amount: undefined, amountAtomic: '100000' })).not.toThrow();
+  });
+
+  it('사람 표기는 amount 로, raw 는 amountAtomic 으로 서버에 보낸다 (변환은 서버 몫)', async () => {
+    const sent: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_u: string, init: RequestInit) => {
+      if (init?.body) sent.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(REQUIREMENTS_OK.body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    await gate({ amount: '0.1' }).requirements(RESOURCE);
+    expect(sent[0]).toMatchObject({ amount: '0.1' });
+    expect(sent[0]).not.toHaveProperty('amountAtomic');
+
+    sent.length = 0;
+    await gate({ amount: undefined, amountAtomic: '100000' }).requirements(RESOURCE);
+    expect(sent[0]).toMatchObject({ amountAtomic: '100000' });
+    expect(sent[0]).not.toHaveProperty('amount');
   });
 });
 

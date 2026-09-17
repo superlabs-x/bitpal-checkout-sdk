@@ -106,6 +106,27 @@ describe('@bitpal/checkout — 안2 deposit-address 결제', () => {
     expect(calls[0]!.url).toBe('http://api.test/v1/checkout/sessions/cs_123/status');
     expect(res.data.status).toBe('deposit_detected');
   });
+
+  it('previewFee — 사람 표기는 amount, raw 는 amount_atomic 으로 보낸다', async () => {
+    // line item / Price / x402 와 같은 금액 모델. 머천트가 decimals 를 계산하지 않는다.
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    stub(calls, { data: { amount: '100000000', fee_rate: '0.015', fee_amount: '1500000', net_amount: '98500000' } });
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+
+    await client.previewFee('100');
+    expect(calls[0]!.url).toContain('amount=100');
+    expect(calls[0]!.url).not.toContain('amount_atomic');
+
+    await client.previewFee({ amountAtomic: '100000000' });
+    expect(calls[1]!.url).toContain('amount_atomic=100000000');
+  });
+
+  it('previewFee — atomic 을 문자열로 넘기던 실수를 잡아준다', async () => {
+    // 구 계약(atomic 문자열)을 그대로 넘기면 백배가 되므로 형식에서 끊는다.
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await expect(client.previewFee('0.0000001')).rejects.toThrow(/decimal string/);
+  });
+
 });
 
 describe('@bitpal/checkout - createSession allowed_pay_chains (MULTICHAIN-MERCHANT-UI-3)', () => {
@@ -161,4 +182,5 @@ describe('@bitpal/checkout - createSession allowed_pay_chains (MULTICHAIN-MERCHA
     await client.createSession({ line_items: lineItems, pay_chain: 'eip155:84532' });
     expect(JSON.parse(String(calls[0]!.init.body))).toMatchObject({ pay_chain: 'eip155:84532' });
   });
+
 });

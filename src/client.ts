@@ -245,12 +245,26 @@ export class BitPalCheckoutClient {
 
   /* ─── Fees ─── */
 
-  /** 수수료 미리보기 — `/v1/checkout/fee-preview` (Phase 1 credit system 폐기 후 canonical path) */
-  async previewFee(amount: string): Promise<ApiResponse<FeePreview>> {
-    return this.request<ApiResponse<FeePreview>>(
-      'GET',
-      `/v1/checkout/fee-preview?amount=${encodeURIComponent(amount)}`,
-    );
+  /**
+   * 수수료 미리보기 — `/v1/checkout/fee-preview`.
+   *
+   * `amount` 는 **사람 표기**다("100", "0.5") — line item / Price / x402 와 같은 모델이라
+   * decimals 를 계산할 필요가 없다. raw μUSD 를 직접 넣으려면 `amountAtomic` 을 쓴다(상호 배타).
+   * 응답은 계속 atomic 이다(계산 결과라 정밀도가 곧 계약이다).
+   *
+   * @example
+   * const { data } = await bp.checkout.previewFee('100');       // $100
+   * const { data } = await bp.checkout.previewFee({ amountAtomic: '100000000' });
+   */
+  async previewFee(amount: string | { amountAtomic: string }): Promise<ApiResponse<FeePreview>> {
+    const qs =
+      typeof amount === 'string'
+        ? `amount=${encodeURIComponent(amount)}`
+        : `amount_atomic=${encodeURIComponent(amount.amountAtomic)}`;
+    if (typeof amount === 'string' && !/^(0|[1-9]\d*)(\.\d{1,6})?$/.test(amount)) {
+      throw new Error('[BitPal] previewFee: amount must be a decimal string like "100" or "0.5" (max 6 decimals). For raw μUSD use { amountAtomic }.');
+    }
+    return this.request<ApiResponse<FeePreview>>('GET', `/v1/checkout/fee-preview?${qs}`);
   }
 }
 
