@@ -208,7 +208,7 @@ app.get('/report', x402({
   apiKey: process.env.BITPAL_API_KEY,   // bp_test_… or bp_live_…
   payTo: '0xYourPayoutWallet',
   network: 'base',                      // test key → 'base-sepolia'
-  amount: '1000000',                    // atomic (USDC, 6dp) — your gross; the fee comes out of it
+  amount: '1.00',                       // human-readable — no decimals math
 }), (req, res) => {
   res.json({ report: '…' });            // req.x402Payment has the txHash
 });
@@ -266,6 +266,9 @@ if (res.status === 402) {
 |---|---|---|
 | Base | USDC | `base` |
 | Base Sepolia | USDC | `base-sepolia` |
+
+Amounts are human-readable (`'1.00'`), the same model as `line_items[].amount` — the server converts.
+Pass `amountAtomic` instead if you already have raw units.
 
 EOA signers only — smart-contract wallets cannot sign EIP-3009 authorizations. Amounts are exact:
 over- and underpayment are both rejected, and this lane has no refund path. Authorizations are valid
