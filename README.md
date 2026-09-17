@@ -180,6 +180,7 @@ app.post(
 | `checkout.session.expired` | Session expired unpaid |
 | `checkout.session.unresolved` | Underpaid / overpaid / wrong token — needs review |
 | `checkout.refund.recorded` | An on-chain auto-refund (over / under / late payment) was recorded |
+| `x402.payment.resolved` | An x402 payment that `/settle` left unresolved was later settled on-chain (see below) |
 
 ### ⚠️ Replay defense + at-least-once delivery
 
@@ -226,6 +227,12 @@ handler with `X-PAYMENT-RESPONSE` set. The middleware also does what the API can
   `failed` get a fresh `402`. Everything else — settlement still in flight, an uncertain broadcast, a
   timeout — answers `503` and asks for a retry with the *same* header. Handing back a `402` there
   would make the caller re-sign and pay twice.
+
+When `/settle` answers `503`, nobody knows yet whether the money moved — so BitPal watches the chain
+and tells you how it ended with a **`x402.payment.resolved`** webhook (`status`: `confirmed` |
+`reverted` | `expired`, plus `payment_id` and `tx_hash`). It fires only on that path: the normal case
+already returned the result to you, and you should not have to handle the same outcome twice. Verify
+it exactly like a checkout webhook.
 
 Not on Express? `X402Gate` is the framework-neutral core — give it the header and the resource URL,
 it tells you whether to bill or serve. On a `settled` result, call `commit()` once you have delivered
