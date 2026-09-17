@@ -89,7 +89,7 @@ export type {
   X402Response,
 } from './x402.js';
 
-export { createX402Payment, splitSignature, TRANSFER_WITH_AUTHORIZATION_TYPES } from './x402-pay.js';
+export { createX402Payment, normalizeSignature, TRANSFER_WITH_AUTHORIZATION_TYPES } from './x402-pay.js';
 export type {
   CreateX402PaymentOptions,
   X402PaymentResult,

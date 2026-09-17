@@ -79,6 +79,7 @@ export interface X402Requirements {
 
 /* ─── X-PAYMENT payload ─── */
 
+/** EIP-3009 `TransferWithAuthorization` 의 서명 대상 필드. x402 표준 `payload.authorization`. */
 export interface Eip3009Authorization {
   from: string;
   to: string;
@@ -86,18 +87,24 @@ export interface Eip3009Authorization {
   validAfter: string;
   validBefore: string;
   nonce: string;
-  signature: { v: number; r: string; s: string };
 }
 
+/**
+ * x402 표준 payload 그대로다 — 단일 authorization + 65바이트 packed 서명.
+ *
+ * 0.10.0 까지는 `{ merchant, fee }` 2건이었다. 포워더 없이 수수료를 나누려면 payer 가 두 번
+ * 서명해야 했고, 그 탓에 순정 x402 클라이언트가 BitPal 머천트에게 결제할 수 없었다.
+ * 이제 분배는 `payTo`(포워더) 주소가 커밋하므로 서명이 1건이면 된다.
+ */
 export interface X402PaymentPayload {
   x402Version: 1;
   scheme: 'exact';
   /** x402 wire 이름 — 'base' / 'base-sepolia'. */
   network: string;
   payload: {
-    merchant: Eip3009Authorization;
-    /** 서버가 계산한 feeAmount > 0 이면 필수. */
-    fee?: Eip3009Authorization;
+    /** 65바이트 packed hex(`0x` + r + s + v). */
+    signature: string;
+    authorization: Eip3009Authorization;
   };
 }
 
@@ -309,13 +316,13 @@ export class X402Gate {
       return this.paymentRequired(resource, 'MALFORMED_PAYMENT_HEADER');
     }
 
-    const merchant = payload?.payload?.merchant;
-    if (!merchant?.from || !merchant?.nonce) {
+    const auth = payload?.payload?.authorization;
+    if (!auth?.from || !auth?.nonce) {
       return this.paymentRequired(resource, 'MALFORMED_PAYMENT_HEADER');
     }
 
     // 키 스코프는 EIP-3009 의 온체인 유일성 스코프와 같다(network + from + nonce).
-    const key = `${payload.network}:${merchant.from.toLowerCase()}:${merchant.nonce.toLowerCase()}`;
+    const key = `${payload.network}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`;
     const claim = await this.store.claim(key, this.maxTimeoutSeconds);
     if (claim === 'used') {
       return {
@@ -428,7 +435,7 @@ export class X402Gate {
       txHash: settled.tx_hash,
       feeTxHash: settled.fee_tx_hash ?? null,
       network: settled.network,
-      payer: merchant.from,
+      payer: auth.from,
       amount: accept.maxAmountRequired,
       idempotent: settled.idempotent ?? false,
     };
@@ -441,7 +448,7 @@ export class X402Gate {
         success: true,
         transaction: settled.tx_hash,
         network: settled.network,
-        payer: merchant.from,
+        payer: auth.from,
         paymentId: settled.payment_id,
       }),
       // 소진 확정은 **응답을 실제로 내준 뒤**다. 핸들러가 throw 하거나 프로세스가 죽으면 결제만 하고
@@ -658,19 +665,25 @@ function assertPaymentPayload(value: unknown): X402PaymentPayload {
     throw new Error('[BitPal] x402: invalid network.');
   }
   const inner = asObject(root.payload, 'payload');
-  const merchant = assertAuthorization(inner.merchant, 'merchant');
-  const fee = inner.fee === undefined ? undefined : assertAuthorization(inner.fee, 'fee');
+  if (typeof inner.signature !== 'string' || !PACKED_SIG_RE.test(inner.signature)) {
+    throw new Error('[BitPal] x402: invalid payload.signature (expected 65-byte packed hex).');
+  }
   return {
     x402Version: 1,
     scheme: 'exact',
     network: root.network,
-    payload: fee ? { merchant, fee } : { merchant },
+    payload: {
+      signature: inner.signature,
+      authorization: assertAuthorization(inner.authorization, 'authorization'),
+    },
   };
 }
 
+/** 65바이트 packed 서명 — x402 표준 형태. */
+const PACKED_SIG_RE = /^0x[0-9a-fA-F]{130}$/;
+
 function assertAuthorization(value: unknown, label: string): Eip3009Authorization {
-  const a = asObject(value, `${label} authorization`);
-  const sig = asObject(a.signature, `${label} signature`);
+  const a = asObject(value, label);
   const check = (ok: boolean, field: string): void => {
     if (!ok) throw new Error(`[BitPal] x402: invalid ${label}.${field}.`);
   };
@@ -680,9 +693,6 @@ function assertAuthorization(value: unknown, label: string): Eip3009Authorizatio
   check(typeof a.validAfter === 'string' && DECIMAL_RE.test(a.validAfter), 'validAfter');
   check(typeof a.validBefore === 'string' && DECIMAL_RE.test(a.validBefore), 'validBefore');
   check(typeof a.nonce === 'string' && HEX32_RE.test(a.nonce), 'nonce');
-  check(typeof sig.v === 'number' && Number.isInteger(sig.v), 'signature.v');
-  check(typeof sig.r === 'string' && HEX32_RE.test(sig.r), 'signature.r');
-  check(typeof sig.s === 'string' && HEX32_RE.test(sig.s), 'signature.s');
   // 검증된 필드만 복사한다 — 원본 객체를 그대로 넘기면 임의 키가 API 바디까지 따라간다.
   return {
     from: a.from as string,
@@ -691,7 +701,6 @@ function assertAuthorization(value: unknown, label: string): Eip3009Authorizatio
     validAfter: a.validAfter as string,
     validBefore: a.validBefore as string,
     nonce: a.nonce as string,
-    signature: { v: sig.v as number, r: sig.r as string, s: sig.s as string },
   };
 }
 

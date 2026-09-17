@@ -137,58 +137,44 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
     throw new Error('[BitPal] x402: the 402 response is missing extra.chainId — cannot build the EIP-712 domain.');
   }
 
-  // 두 leg 는 같은 창을 공유한다. validAfter=0 이면 "언제부터든 유효" 라 시계 오차에 안 걸린다.
+  // validAfter=0 이면 "언제부터든 유효" 라 payer/서버 시계 오차에 걸리지 않는다.
   const validAfter = '0';
   const validBefore = String(now + validFor);
-  const nextNonce = options.randomNonce ?? randomNonce;
+  const nonce = (options.randomNonce ?? randomNonce)();
 
-  const fee = accept.feeBreakdown;
-  const feeAmount = fee ? BigInt(fee.feeAmount) : 0n;
-  // feeBreakdown 이 없는 평범한 x402 402 면 maxAmountRequired 전액이 머천트 몫이다.
-  const merchantValue = fee ? fee.netAmount : accept.maxAmountRequired;
-
-  const merchant = await signAuthorization({
-    domain,
-    signTypedData: options.signTypedData,
+  // **서명은 1건이다.** `payTo` 는 머천트 지갑이 아니라 분배 조건을 CREATE2 로 커밋한 포워더
+  //   주소이고, 거기로 gross 전액을 보낸다. 수수료를 쪼개는 건 그 주소가 온체인에서 한다.
+  //   그래서 payer 는 `feeBreakdown` 을 읽을 필요가 없다 — 순정 x402 클라이언트도 이 402 로
+  //   똑같이 결제할 수 있다는 뜻이다.
+  const authorization: Eip3009Authorization = {
     from: options.from,
     to: accept.payTo,
-    value: merchantValue,
+    value: accept.maxAmountRequired,
     validAfter,
     validBefore,
-    nonce: nextNonce(),
-  });
+    nonce,
+  };
 
-  let feeLeg: Eip3009Authorization | undefined;
-  if (feeAmount > 0n) {
-    if (!fee?.feeRecipient) {
-      throw new Error('[BitPal] x402: feeAmount > 0 but feeRecipient is missing in the 402 response.');
-    }
-    feeLeg = await signAuthorization({
+  const signature = normalizeSignature(
+    await options.signTypedData({
       domain,
-      signTypedData: options.signTypedData,
-      from: options.from,
-      to: fee.feeRecipient,
-      value: fee.feeAmount,
-      validAfter,
-      validBefore,
-      nonce: nextNonce(),
-    });
-    if (feeLeg.nonce.toLowerCase() === merchant.nonce.toLowerCase()) {
-      throw new Error('[BitPal] x402: the two authorizations must use different nonces.');
-    }
-  }
+      types: TRANSFER_WITH_AUTHORIZATION_TYPES,
+      primaryType: 'TransferWithAuthorization',
+      message: authorization,
+    }),
+  );
 
   const payload: X402PaymentPayload = {
     x402Version: 1,
     scheme: 'exact',
     network: accept.network,
-    payload: feeLeg ? { merchant, fee: feeLeg } : { merchant },
+    payload: { signature, authorization },
   };
 
   return {
     header: encodePaymentHeader(payload),
     payload,
-    totalAmount: (BigInt(merchantValue) + feeAmount).toString(),
+    totalAmount: accept.maxAmountRequired,
   };
 }
 
@@ -203,62 +189,43 @@ function resolveAccept(input: X402Requirements | X402Accept): X402Accept {
   return input;
 }
 
-async function signAuthorization(args: {
-  domain: Eip712Domain;
-  signTypedData: X402Signer;
-  from: string;
-  to: string;
-  value: string;
-  validAfter: string;
-  validBefore: string;
-  nonce: string;
-}): Promise<Eip3009Authorization> {
-  const message = {
-    from: args.from,
-    to: args.to,
-    value: args.value,
-    validAfter: args.validAfter,
-    validBefore: args.validBefore,
-    nonce: args.nonce,
-  };
-  const signature = await args.signTypedData({
-    domain: args.domain,
-    types: TRANSFER_WITH_AUTHORIZATION_TYPES,
-    primaryType: 'TransferWithAuthorization',
-    message,
-  });
-  return { ...message, signature: splitSignature(signature) };
-}
-
 /**
  * 서명 → `{v, r, s}`. BitPal API 가 요구하는 분해 형태.
  *
  * 65바이트(r‖s‖v)와 64바이트 EIP-2098 compact(r‖yParityAndS) 둘 다 받는다 — viem 의
  * `signTypedData` 는 65바이트를 주지만 일부 지갑·라이브러리는 compact 를 돌려준다.
  */
-export function splitSignature(signature: string): { v: number; r: string; s: string } {
+/**
+ * 지갑이 돌려준 서명을 **65바이트 packed hex** 로 수렴시킨다. x402 표준이 그 형태다.
+ *
+ * 두 가지를 정규화한다:
+ *   - EIP-2098 compact(64바이트) — 일부 지갑이 이걸 낸다. s 의 최상위 비트가 yParity 라 떼어내고
+ *     v 를 복원해 65바이트로 편다.
+ *   - v 가 0/1 인 경우 — 온체인 ecrecover 규약인 27/28 로 맞춘다.
+ *
+ * 서버가 130 hex 만 받으므로 여기서 안 맞추면 그쪽에서 거부된다. 그 외 값은 recover 가 어긋나
+ * 어차피 실패하므로 여기서 끊는다.
+ */
+export function normalizeSignature(signature: string): string {
   const hex = signature.startsWith('0x') ? signature.slice(2) : signature;
   if (!/^[0-9a-fA-F]+$/.test(hex) || (hex.length !== 130 && hex.length !== 128)) {
     throw new Error(
       `[BitPal] x402: expected a 65-byte or 64-byte (EIP-2098) hex signature, got ${signature.length} chars.`,
     );
   }
-  const r = `0x${hex.slice(0, 64)}`;
+  const r = hex.slice(0, 64);
 
   if (hex.length === 128) {
-    // EIP-2098: s 의 최상위 비트가 yParity. 그 비트를 떼어내야 정상 s 가 된다.
     const yParityAndS = BigInt(`0x${hex.slice(64, 128)}`);
     const yParity = Number((yParityAndS >> 255n) & 1n);
-    const s = yParityAndS & ((1n << 255n) - 1n);
-    return { v: 27 + yParity, r, s: `0x${s.toString(16).padStart(64, '0')}` };
+    const s = (yParityAndS & ((1n << 255n) - 1n)).toString(16).padStart(64, '0');
+    return `0x${r}${s}${(27 + yParity).toString(16).padStart(2, '0')}`;
   }
 
-  const s = `0x${hex.slice(64, 128)}`;
+  const s = hex.slice(64, 128);
   const raw = parseInt(hex.slice(128, 130), 16);
-  // 지갑에 따라 v 를 0/1 로 준다 — 온체인 ecrecover 규약인 27/28 로 맞춘다.
-  //   그 외 값은 서버로 보내봐야 recover 가 어긋나므로 여기서 끊는다.
-  if (raw === 27 || raw === 28) return { v: raw, r, s };
-  if (raw === 0 || raw === 1) return { v: raw + 27, r, s };
+  if (raw === 27 || raw === 28) return `0x${r}${s}${raw.toString(16)}`;
+  if (raw === 0 || raw === 1) return `0x${r}${s}${(raw + 27).toString(16)}`;
   throw new Error(`[BitPal] x402: unexpected signature v=${raw} (expected 0, 1, 27 or 28).`);
 }
 

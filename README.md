@@ -249,9 +249,13 @@ the response, or `release()` if you could not.
 
 ### Payer side
 
-The fee split needs two authorizations, which a stock x402 client does not know about.
-`createX402Payment` reads the `402` and builds both. You supply the signer; the SDK has no crypto
-dependency.
+The payer signs **one** standard EIP-3009 authorization, so the `X-PAYMENT` payload is plain x402:
+`{ signature, authorization }`. The fee split happens on-chain — `payTo` in the `402` is not the
+merchant's wallet but a CREATE2 address that commits to the whole split, so nothing extra has to be
+signed for it.
+
+`createX402Payment` reads the `402` and builds the header. You supply the signer; the SDK has no
+crypto dependency.
 
 ```ts
 import { createX402Payment } from '@bitpal/checkout';
@@ -276,6 +280,10 @@ if (res.status === 402) {
 
 Amounts are human-readable (`'1.00'`), the same model as `line_items[].amount` — the server converts.
 Pass `amountAtomic` instead if you already have raw units.
+
+The `402` also carries a `feeBreakdown` (net / fee / bps / recipient). It is informational — a payer
+can ignore it entirely and still pay correctly, because the split is already committed by the `payTo`
+address. It is there so you can see where the money goes without reading the chain.
 
 EOA signers only — smart-contract wallets cannot sign EIP-3009 authorizations. Amounts are exact:
 over- and underpayment are both rejected, and this lane has no refund path. Authorizations are valid
@@ -307,6 +315,26 @@ store wiring session creation + webhook verification + idempotency.
 ```bash
 pnpm build   # tsup → dist/ (ESM + .d.ts)
 ```
+
+## Migrating to 0.11.0 (breaking — x402 payer only)
+
+The `X-PAYMENT` payload changed from BitPal's two-authorization shape to the **x402 standard**:
+
+```
+0.10.0   payload: { merchant: {...}, fee: {...} }     two signatures
+0.11.0   payload: { signature, authorization }        one signature — plain x402
+```
+
+- If you call `createX402Payment`, nothing changes in your code. It signs once now instead of twice,
+  and the wallet prompts once.
+- If you built the payload by hand, rebuild it in the standard shape.
+- `splitSignature` is gone. `normalizeSignature` replaces it — same input handling (65-byte or
+  EIP-2098 compact, `v` of 0/1/27/28) but it returns a 65-byte packed hex string, which is what the
+  payload carries.
+- The `402` is unchanged apart from `payTo`, which now points at the settlement address rather than
+  the merchant wallet. Both `X402Gate` and `x402()` handle this for you.
+
+Old headers are rejected — a payer on 0.10.0 gets a fresh `402` and re-signs, so no payment is lost.
 
 ## Migrating from 0.3.x → 0.5.0 (breaking)
 

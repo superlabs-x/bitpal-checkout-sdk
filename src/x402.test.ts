@@ -28,16 +28,24 @@ const ACCEPT = {
 };
 
 function payload(nonce = `0x${'2'.repeat(64)}`): X402PaymentPayload {
-  const auth = {
-    from: FROM,
-    to: PAY_TO,
-    value: '985000',
-    validAfter: '0',
-    validBefore: '9999999999',
-    nonce,
-    signature: { v: 27, r: `0x${'1'.repeat(64)}`, s: `0x${'3'.repeat(64)}` },
+  return {
+    x402Version: 1,
+    scheme: 'exact',
+    network: 'base',
+    // x402 표준 payload — 단일 authorization + 65바이트 packed 서명.
+    payload: {
+      signature: `0x${'1'.repeat(64)}${'3'.repeat(64)}1b`,
+      authorization: {
+        from: FROM,
+        to: PAY_TO,
+        // gross 다. 포워더가 받아 net/fee 로 쪼갠다.
+        value: '1000000',
+        validAfter: '0',
+        validBefore: '9999999999',
+        nonce,
+      },
+    },
   };
-  return { x402Version: 1, scheme: 'exact', network: 'base', payload: { merchant: auth } };
 }
 
 /** path 별 응답을 순서대로 꺼내 쓰는 fetch stub. */
@@ -326,20 +334,21 @@ describe('헤더 인코딩 / replay store', () => {
       mut(p);
       return () => decodePaymentHeader(JSON.stringify(p));
     };
-    expect(bad(p => { p.payload.merchant.from = 'nope'; })).toThrow(/merchant.from/);
-    expect(bad(p => { p.payload.merchant.value = '-1'; })).toThrow(/merchant.value/);
-    expect(bad(p => { p.payload.merchant.nonce = '0x1234'; })).toThrow(/merchant.nonce/);
+    expect(bad(p => { p.payload.authorization.from = 'nope'; })).toThrow(/authorization.from/);
+    expect(bad(p => { p.payload.authorization.value = '-1'; })).toThrow(/authorization.value/);
+    expect(bad(p => { p.payload.authorization.nonce = '0x1234'; })).toThrow(/authorization.nonce/);
+    expect(bad(p => { p.payload.signature = '0xdead'; })).toThrow(/payload.signature/);
     expect(bad(p => { (p as { x402Version: number }).x402Version = 2; })).toThrow(/x402Version/);
     expect(() => decodePaymentHeader('x'.repeat(9000))).toThrow(/too large/);
   });
 
   it('검증된 필드만 통과시킨다 — 임의 키가 API 바디로 새지 않는다', () => {
     const p = payload() as unknown as Record<string, unknown>;
-    (p.payload as { merchant: Record<string, unknown> }).merchant.__proto__x = 'evil';
-    (p.payload as { merchant: Record<string, unknown> }).merchant.extra = 'junk';
+    (p.payload as { authorization: Record<string, unknown> }).authorization.__proto__x = 'evil';
+    (p.payload as { authorization: Record<string, unknown> }).authorization.extra = 'junk';
     const decoded = decodePaymentHeader(JSON.stringify(p));
-    expect(Object.keys(decoded.payload.merchant).sort()).toEqual(
-      ['from', 'nonce', 'signature', 'to', 'validAfter', 'validBefore', 'value'],
+    expect(Object.keys(decoded.payload.authorization).sort()).toEqual(
+      ['from', 'nonce', 'to', 'validAfter', 'validBefore', 'value'],
     );
   });
 

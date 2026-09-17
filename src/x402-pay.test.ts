@@ -1,16 +1,21 @@
 /**
  * payer 헬퍼 — 서버가 요구하는 제약을 그대로 만족하는 payload 를 만드는지 본다.
  *
- * 서버 검증(x402-facilitator)이 요구하는 것: merchant.value === netAmount, fee.value === feeAmount,
- * 두 leg 의 서명자 동일, nonce 상이, fee 유효창이 merchant 유효창을 덮을 것.
+ * 0.11.0 에서 계약이 바뀌었다. 예전에는 머천트 몫/수수료 몫 **2건**에 서명했고, 이 파일 절반이
+ * "두 leg 의 금액·nonce·유효창이 서버 제약을 만족하는가" 였다. 이제 분배는 `payTo`(포워더)
+ * 주소가 커밋하므로 **서명은 1건**이고, payload 는 x402 표준 `{ signature, authorization }` 이다.
+ *
+ * 그래서 여기서 잠그는 것도 바뀌었다 — 서명이 정확히 1건인가, `to` 가 402 의 payTo 인가,
+ * `value` 가 gross 인가(수수료 차감 전 총액), 그리고 payload 모양이 표준인가.
  */
 import { describe, expect, it } from 'vitest';
-import { createX402Payment, splitSignature } from './x402-pay.js';
+import { createX402Payment, normalizeSignature } from './x402-pay.js';
 import { decodePaymentHeader } from './x402.js';
 import type { X402Accept } from './x402.js';
 import type { X402TypedDataRequest } from './x402-pay.js';
 
 const FROM = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+/** 402 의 payTo — 머천트 지갑이 아니라 분배 조건을 커밋한 포워더 주소다. */
 const PAY_TO = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const FEE_TO = '0xcccccccccccccccccccccccccccccccccccccccc';
 
@@ -45,7 +50,7 @@ let counter = 0;
 const nonce = () => `0x${String(++counter).padStart(64, '0')}`;
 
 describe('createX402Payment', () => {
-  it('수수료가 있으면 두 authorization 에 서명한다 — 금액·수신처가 서버 분해와 정확히 일치', async () => {
+  it('서명은 1건 — gross 전액을 402 의 payTo 로 보낸다', async () => {
     counter = 0;
     const r = recorder();
     const result = await createX402Payment({
@@ -55,17 +60,17 @@ describe('createX402Payment', () => {
       randomNonce: nonce,
     });
 
-    expect(r.seen).toHaveLength(2);
+    // 수수료가 있어도 서명은 하나다 — 분배는 payTo 주소가 온체인에서 한다.
+    expect(r.seen).toHaveLength(1);
     const p = decodePaymentHeader(result.header);
-    expect(p.payload.merchant.to).toBe(PAY_TO);
-    expect(p.payload.merchant.value).toBe('985000');
-    expect(p.payload.fee!.to).toBe(FEE_TO);
-    expect(p.payload.fee!.value).toBe('15000');
-    // 지갑에서 실제로 빠지는 총액 = 402 가 표시한 금액.
+    expect(p.payload.authorization.to).toBe(PAY_TO);
+    // net(985000)이 아니라 gross 다. net 만 보내면 서버가 AMOUNT_MISMATCH 로 거부한다.
+    expect(p.payload.authorization.value).toBe('1000000');
+    expect(p.payload.authorization.from).toBe(FROM);
     expect(result.totalAmount).toBe('1000000');
   });
 
-  it('두 leg 의 서명자는 같고 nonce 는 다르며 유효창은 동일하다 (서버 제약)', async () => {
+  it('payload 모양이 x402 표준이다 — { signature, authorization }', async () => {
     counter = 0;
     const result = await createX402Payment({
       requirements: ACCEPT,
@@ -73,12 +78,26 @@ describe('createX402Payment', () => {
       signTypedData: recorder().sign,
       randomNonce: nonce,
     });
-    const { merchant, fee } = decodePaymentHeader(result.header).payload;
-    expect(fee!.from).toBe(merchant.from);
-    expect(fee!.nonce).not.toBe(merchant.nonce);
-    // fee 창이 merchant 창보다 짧으면 서버가 FEE_AUTHORIZATION_MISMATCH 로 거부한다.
-    expect(BigInt(fee!.validBefore) >= BigInt(merchant.validBefore)).toBe(true);
-    expect(BigInt(fee!.validAfter) <= BigInt(merchant.validAfter)).toBe(true);
+    const p = decodePaymentHeader(result.header);
+    // 이 모양이라야 순정 x402 클라이언트/서버와 상호운용된다.
+    expect(Object.keys(p.payload).sort()).toEqual(['authorization', 'signature']);
+    expect(p.payload.signature).toMatch(/^0x[0-9a-f]{130}$/i);
+    expect(p.scheme).toBe('exact');
+    expect(p.network).toBe('base');
+  });
+
+  it('feeBreakdown 을 아예 안 봐도 된다 — 순정 402 도 동일하게 처리한다', async () => {
+    counter = 0;
+    const { feeBreakdown: _drop, ...plain } = ACCEPT;
+    const withFee = await createX402Payment({ requirements: ACCEPT, from: FROM, signTypedData: recorder().sign, randomNonce: nonce });
+    counter = 0;
+    const withoutFee = await createX402Payment({ requirements: plain as X402Accept, from: FROM, signTypedData: recorder().sign, randomNonce: nonce });
+
+    // 서명 대상이 같다 — payer 입장에서 feeBreakdown 은 정보일 뿐 계약이 아니다.
+    const a = decodePaymentHeader(withFee.header).payload.authorization;
+    const b = decodePaymentHeader(withoutFee.header).payload.authorization;
+    expect(b.to).toBe(a.to);
+    expect(b.value).toBe(a.value);
   });
 
   it('EIP-712 domain 은 402 의 extra + asset 으로 구성한다', async () => {
@@ -92,35 +111,8 @@ describe('createX402Payment', () => {
       verifyingContract: ACCEPT.asset,
     });
     expect(r.seen[0]!.primaryType).toBe('TransferWithAuthorization');
-  });
-
-  it('수수료가 0이면 authorization 은 하나뿐이고 전액이 머천트 몫이다', async () => {
-    counter = 0;
-    const r = recorder();
-    const result = await createX402Payment({
-      requirements: { ...ACCEPT, feeBreakdown: { netAmount: '1000000', feeAmount: '0', feeBps: 0, feeRecipient: null } },
-      from: FROM,
-      signTypedData: r.sign,
-      randomNonce: nonce,
-    });
-    expect(r.seen).toHaveLength(1);
-    const p = decodePaymentHeader(result.header);
-    expect(p.payload.fee).toBeUndefined();
-    expect(p.payload.merchant.value).toBe('1000000');
-  });
-
-  it('feeBreakdown 없는 순정 x402 402 도 처리한다', async () => {
-    counter = 0;
-    const { feeBreakdown: _drop, ...plain } = ACCEPT;
-    const result = await createX402Payment({
-      requirements: plain as X402Accept,
-      from: FROM,
-      signTypedData: recorder().sign,
-      randomNonce: nonce,
-    });
-    const p = decodePaymentHeader(result.header);
-    expect(p.payload.fee).toBeUndefined();
-    expect(p.payload.merchant.value).toBe('1000000');
+    // 서명 대상 메시지가 authorization 그대로여야 서버 recover 가 맞는다.
+    expect(r.seen[0]!.message).toMatchObject({ from: FROM, to: PAY_TO, value: '1000000' });
   });
 
   it('유효시간이 허용 범위 밖이면 서명 전에 막는다 (서버 60초 + 시계오차 마진 30초)', async () => {
@@ -146,34 +138,30 @@ describe('createX402Payment', () => {
   });
 });
 
-describe('splitSignature', () => {
-  it('65바이트 서명을 v/r/s 로 쪼갠다', () => {
-    expect(splitSignature(SIG)).toEqual({
-      v: 27,
-      r: `0x${'1'.repeat(64)}`,
-      s: `0x${'2'.repeat(64)}`,
-    });
+describe('normalizeSignature', () => {
+  it('65바이트 서명은 그대로 통과시킨다', () => {
+    expect(normalizeSignature(SIG)).toBe(SIG);
   });
 
   it('v 를 0/1 로 주는 지갑은 27/28 로 정규화한다', () => {
-    expect(splitSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}00`).v).toBe(27);
-    expect(splitSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}01`).v).toBe(28);
+    const base = `${'1'.repeat(64)}${'2'.repeat(64)}`;
+    expect(normalizeSignature(`0x${base}00`)).toBe(`0x${base}1b`);
+    expect(normalizeSignature(`0x${base}01`)).toBe(`0x${base}1c`);
   });
 
-  it('EIP-2098 compact(64바이트) 서명도 받는다', () => {
-    // yParityAndS 의 최상위 비트가 yParity. 그 비트를 떼어야 정상 s 가 된다.
+  it('EIP-2098 compact(64바이트)를 65바이트로 편다', () => {
+    // 서버는 130 hex 만 받는다 — 여기서 안 펴면 그쪽에서 거부된다.
     const s = '2'.repeat(64);
-    const compactEven = `0x${'1'.repeat(64)}${s}`;
-    expect(splitSignature(compactEven)).toEqual({ v: 27, r: `0x${'1'.repeat(64)}`, s: `0x${s}` });
+    expect(normalizeSignature(`0x${'1'.repeat(64)}${s}`)).toBe(`0x${'1'.repeat(64)}${s}1b`);
 
-    // 최상위 비트를 세운 경우 → v=28, s 는 비트를 뗀 값
+    // 최상위 비트를 세운 경우 → v=28, s 는 그 비트를 뗀 값
     const high = (BigInt(`0x${s}`) | (1n << 255n)).toString(16).padStart(64, '0');
-    expect(splitSignature(`0x${'1'.repeat(64)}${high}`)).toEqual({ v: 28, r: `0x${'1'.repeat(64)}`, s: `0x${s}` });
+    expect(normalizeSignature(`0x${'1'.repeat(64)}${high}`)).toBe(`0x${'1'.repeat(64)}${s}1c`);
   });
 
   it('길이가 안 맞거나 v 가 규약 밖이면 throw', () => {
-    expect(() => splitSignature('0xdeadbeef')).toThrow(/65-byte or 64-byte/);
+    expect(() => normalizeSignature('0xdeadbeef')).toThrow(/65-byte or 64-byte/);
     // v=2 같은 값을 27+2=29 로 만들어 서버로 보내면 recover 가 어긋난다 — 여기서 끊는다.
-    expect(() => splitSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}02`)).toThrow(/unexpected signature v=2/);
+    expect(() => normalizeSignature(`0x${'1'.repeat(64)}${'2'.repeat(64)}02`)).toThrow(/unexpected signature v=2/);
   });
 });
