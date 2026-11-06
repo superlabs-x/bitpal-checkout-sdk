@@ -21,16 +21,38 @@ import type {
 import { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
 
 /**
- * line item one-of 검증 — 금액은 `amount`(사람 USD) XOR `amount_atomic`(raw μUSD) 중 하나.
- * 변환은 서버가 수행하므로 SDK 는 그대로 전달(체인/토큰 decimal 무관 — 발급 시 서버가 재스케일).
- * price_id 항목은 서버가 금액 resolve 하므로 그대로. 둘 다/둘 다없음은 SDK 가 즉시 에러.
+ * line item one-of 검증 — 금액은 `amount`(사람 표기 canonical 6dp) XOR `amount_atomic`(raw canonical
+ * 6dp) 중 하나. 실제 결제 통화는 `currency`('USDC'/'USDT'/'JPYC')가 결정하고 amount 는 그 통화 기준
+ * 값이다(USD 로 고정된 게 아님). 변환은 서버가 수행하므로 SDK 는 그대로 전달(실제 토큰 decimal 무관 —
+ * 발급 시 서버가 재스케일). price_id 항목은 서버가 금액 resolve 하므로 그대로. 둘 다/둘 다없음은 SDK 가
+ * 즉시 에러.
  */
+/** API 의 결제 대기 시간 범위(분) — createSessionSchema.expires_in_minutes 와 같다. */
+const EXPIRY_MIN_MINUTES = 1;
+const EXPIRY_MAX_MINUTES = 60;
+
+/**
+ * expires_in_minutes / (deprecated) expires_in_seconds → API 의 expires_in_minutes.
+ * 서버는 expires_in_seconds 를 모른다(조용히 무시돼 항상 15분이었다) — SDK 가 분으로 변환해 보낸다.
+ */
+function resolveExpiryMinutes(minutes: number | undefined, seconds: number | undefined): number | undefined {
+  if (minutes !== undefined && seconds !== undefined) {
+    throw new Error("[BitPal] pass only one of `expires_in_minutes` or `expires_in_seconds`.");
+  }
+  const resolved = seconds !== undefined ? Math.ceil(seconds / 60) : minutes;
+  if (resolved === undefined) return undefined;
+  if (!Number.isInteger(resolved) || resolved < EXPIRY_MIN_MINUTES || resolved > EXPIRY_MAX_MINUTES) {
+    throw new Error(`[BitPal] session expiry must be ${EXPIRY_MIN_MINUTES}–${EXPIRY_MAX_MINUTES} minutes (expires_in_minutes) — got ${seconds !== undefined ? seconds + "s" : minutes}.`);
+  }
+  return resolved;
+}
+
 function validateLineItem(li: CheckoutLineItemInput): CheckoutLineItemInput {
   if ('price_id' in li) return li;
   const hasHuman = li.amount != null;
   const hasAtomic = li.amount_atomic != null;
   if (hasHuman === hasAtomic) {
-    throw new Error('[BitPal] line item requires exactly one of `amount` (USD number, e.g. "29") or `amount_atomic` (raw μUSD integer, e.g. "29000000").');
+    throw new Error('[BitPal] line item requires exactly one of `amount` (canonical decimal number, e.g. "29") or `amount_atomic` (raw canonical 6dp integer, e.g. "29000000").');
   }
   return li;
 }
@@ -89,11 +111,20 @@ export class BitPalCheckoutClient {
         signal: controller.signal,
       });
 
-      const json = await res.json();
+      // 프록시/게이트웨이 오류(HTML 502 등)는 JSON 이 아니다 — 파싱 실패를 SyntaxError 로 흘리지 않는다.
+      const text = await res.text();
+      let json: unknown = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        if (!res.ok) throw new BitPalError(`HTTP ${res.status}`, res.status);
+        throw new BitPalError(`Invalid JSON response (HTTP ${res.status})`, res.status);
+      }
 
       if (!res.ok) {
-        const msg = (json as Record<string, unknown>).error ?? `HTTP ${res.status}`;
-        throw new BitPalError(String(msg), res.status);
+        const err = json && typeof json === 'object' ? (json as Record<string, unknown>).error : undefined;
+        const msg = typeof err === 'string' && err.length > 0 ? err : `HTTP ${res.status}`;
+        throw new BitPalError(msg, res.status, parseApiErrorBody(json));
       }
 
       return json as T;
@@ -107,14 +138,16 @@ export class BitPalCheckoutClient {
   /**
    * 체크아웃 세션 생성.
    *
-   * `line_items[].amount` 는 사람 표기 USD 문자열("29", "0.5") — decimal 계산 불필요.
-   * 이미 raw μUSD 정수라면 `amount_atomic`("29000000") 사용(고급). 둘은 상호 배타.
+   * `line_items[].amount` 는 사람 표기 canonical 6dp 문자열("29", "0.5") — decimal 계산 불필요.
+   * `currency`('USDC'/'USDT'/'JPYC')가 실제 결제 통화를 결정하고, amount 는 항상 그 통화 기준 값이다
+   * (USD 로 고정된 게 아님 — currency='JPYC' + amount='1500' → 1500엔/1500 JPYC, 환율 변환 없음).
+   * 이미 raw canonical 6dp 정수라면 `amount_atomic`("29000000") 사용(고급). 둘은 상호 배타.
    *
    * @example
    * import { BitPal } from '@bitpal/checkout';
    * const bp = new BitPal('bp_test_...');
    * const { data } = await bp.checkout.createSession({
-   *   // amount: 사람 표기 USD("29", "0.5"). 금액은 USD 가격이라 체인/토큰 decimal 무관.
+   *   // amount: 사람 표기 canonical 6dp("29", "0.5"). 체인/토큰 decimal 은 발급 시 서버가 재스케일.
    *   line_items: [{ name: 'Pro', amount: '29', currency: 'USDC' }],
    * });
    * console.log(data.url); // → buyer를 redirect할 결제 페이지
@@ -136,8 +169,13 @@ export class BitPalCheckoutClient {
     // one-of 검증만 — amount(사람 USD) / amount_atomic(raw μUSD) 변환은 서버가 수행.
     //   allowed_assets 는 SDK 표준 {chain, token} → createSession API 필드명(caip2)으로 매핑.
     //   chain 값(short-name/CAIP-2)은 서버가 mode-relative 로 정규화(payment-link 는 API 가 직접 chain 수용).
+    // payer_wallet / pay_asset 는 deprecated — API 스키마에 없어 서버가 조용히 버리던 필드라 보내지 않는다
+    //   (OpenAPI 계약 테스트 contract.test.ts 가 스펙에 없는 바디 키를 drift 로 잡는다).
+    const { expires_in_seconds, payer_wallet: _payerWallet, pay_asset: _payAsset, ...rest } = params;
+    const expiresInMinutes = resolveExpiryMinutes(params.expires_in_minutes, expires_in_seconds);
     const body = {
-      ...params,
+      ...rest,
+      ...(expiresInMinutes !== undefined ? { expires_in_minutes: expiresInMinutes } : {}),
       line_items: params.line_items.map(validateLineItem),
       ...(params.allowed_assets
         ? { allowed_assets: params.allowed_assets.map((a) => ({ caip2: a.chain, token: a.token })) }
@@ -270,11 +308,56 @@ export class BitPalCheckoutClient {
 
 /* ─── Error ─── */
 
+/** Structured fields parsed from an API error body. All optional — older endpoints omit some. */
+export interface BitPalErrorDetails {
+  /** Machine-readable error code, e.g. `"FEATURE_NOT_ENABLED"`. */
+  code?: string;
+  /** Human-readable message from the API, when it sent one separately from the code. */
+  apiMessage?: string;
+  /** Whether retrying the same request may succeed. */
+  retryable?: boolean;
+  /** Server trace id — include it when contacting support. */
+  traceId?: string;
+}
+
 export class BitPalError extends Error {
   readonly statusCode: number;
-  constructor(message: string, statusCode: number) {
+  readonly code?: string;
+  readonly apiMessage?: string;
+  readonly retryable?: boolean;
+  readonly traceId?: string;
+  constructor(message: string, statusCode: number, details: BitPalErrorDetails = {}) {
     super(message);
     this.name = 'BitPalError';
     this.statusCode = statusCode;
+    this.code = details.code;
+    this.apiMessage = details.apiMessage;
+    this.retryable = details.retryable;
+    this.traceId = details.traceId;
   }
+}
+
+const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * API 에러 body → BitPalError 상세. 두 가지 shape 를 모두 읽는다:
+ *   - 표준: `{ error: <message>, code, retryable, trace_id }`
+ *   - 일부 라우트: `{ error: <CODE>, message }`
+ * `message`(Error.message)는 0.11 과 같게 `body.error` 를 유지한다(하위 호환) — 추가 정보는 필드로만.
+ */
+export function parseApiErrorBody(body: unknown): BitPalErrorDetails {
+  if (!body || typeof body !== 'object') return {};
+  const b = body as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
+  const error = str(b.error);
+  const explicitCode = str(b.code);
+  const message = str(b.message);
+  const code = explicitCode ?? (error && ERROR_CODE_RE.test(error) ? error : undefined);
+  const apiMessage = message ?? (explicitCode && error && error !== explicitCode ? error : undefined);
+  return {
+    code,
+    apiMessage,
+    retryable: typeof b.retryable === 'boolean' ? b.retryable : undefined,
+    traceId: str(b.trace_id),
+  };
 }

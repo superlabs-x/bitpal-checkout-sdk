@@ -42,7 +42,7 @@ const { data: session } = await bitpal.checkout.createSession({
     { name: 'Pro Plan', amount, currency: 'USDC', quantity: 1 },
   ],
   pay_chain: 'eip155:84532', // Base Sepolia (test 키). live: 'eip155:8453'(Base mainnet).
-  expires_in_seconds: 1800,
+  expires_in_minutes: 30,
   success_url: 'http://localhost:3000/success',
   cancel_url: 'http://localhost:3000/cancel',
 });

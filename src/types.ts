@@ -10,9 +10,11 @@ export interface BitPalConfig {
    *
    * BitPal 콘솔 → Developers → API Keys 에서 발급.
    *
-   * **선택**: createSession/listSessions/products 등 서버 메서드는 필수. 그러나 buyer-facing 공개 메서드
-   * (getPublicSession/getStatus/issueDepositAddress)는 인증 불요(session_token 기반)이므로 브라우저에서
-   * apiKey 없이 쓸 수 있다 — 절대 secret 키를 브라우저에 노출하지 말 것.
+   * **선택**: createSession/listSessions/products 등 서버 메서드는 필수. buyer-facing 공개 메서드
+   * (getPublicSession/getStatus/issueDepositAddress)는 apiKey 가 필요 없다(issueDepositAddress 는 session_token 필요).
+   * 단 **브라우저(CORS)** 에서 임의 머천트 도메인이 직접 부를 수 있는 것은 `getPublicSession` 뿐이다 —
+   * `issueDepositAddress`/`getStatus` 는 머천트 백엔드를 경유해 호출한다(자체 결제 UI = 헤드리스 checkout).
+   * 절대 secret 키를 브라우저에 노출하지 말 것.
    */
   apiKey?: string;
   /**
@@ -27,10 +29,10 @@ export interface BitPalConfig {
   timeout?: number;
 }
 
-/** 응답/정규화된 line item — amount 는 항상 atomic μUSD 정수. */
+/** 응답/정규화된 line item — amount 는 항상 canonical 6dp atomic 정수(실제 결제 토큰 decimals 아님). */
 export interface LineItem {
   name: string;
-  /** Atomic μUSD 정수 문자열($1="1000000", $29="29000000"). */
+  /** canonical 6dp atomic 정수 문자열("1"="1000000", "29"="29000000"). */
   amount: string;
   currency: string;
   quantity?: number;
@@ -38,18 +40,20 @@ export interface LineItem {
 
 /**
  * 세션 생성 입력용 line item. 금액은 둘 중 **하나**:
- *   - `amount`(권장): 사람 표기 USD 문자열(예 "29", "0.5", "29.00"). decimal 신경 쓸 필요 없음.
- *     ※ 금액은 **USD 가격**이다(체인/토큰 decimal 무관). 토큰(USDC 6dp / BNB USDT 18dp)별 스케일은 발급 시 서버가 처리.
- *   - `amount_atomic`: 이미 raw μUSD 정수 문자열($1="1000000")인 경우(고급/기존 코드).
+ *   - `amount`(권장): 사람 표기 canonical 6dp 문자열(예 "29", "0.5", "29.00"). decimal 신경 쓸 필요 없음.
+ *     ※ `currency`(예: 'USDC'/'USDT'/'JPYC')가 실제 결제 통화를 결정한다 — `amount`는 그 통화의 canonical
+ *     6dp 표기일 뿐 항상 USD 를 뜻하지 않는다(예: currency='JPYC' + amount="29" → 29 JPYC/29엔, 환율
+ *     변환 없음). 실제 결제 토큰 decimals(USDC 6dp / JPYC 18dp 등)로의 재스케일은 발급 시 서버가 처리.
+ *   - `amount_atomic`: 이미 raw canonical 6dp 정수 문자열($1="1000000")인 경우(고급/기존 코드).
  * 둘 다 지정하거나 둘 다 생략하면 SDK 가 에러를 throw 한다.
  */
 export interface LineItemInput {
   name: string;
   currency: string;
   quantity?: number;
-  /** 사람 표기 USD 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  /** 사람 표기 canonical 6dp 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
   amount?: string;
-  /** raw μUSD 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  /** raw canonical 6dp 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
   amount_atomic?: string;
 }
 
@@ -67,7 +71,7 @@ export type CheckoutLineItemInput = LineItemInput | PriceLineItem;
 
 export interface CreateSessionParams {
   line_items: CheckoutLineItemInput[];
-  /** 고객 지갑 주소 (선택) */
+  /** @deprecated 서버가 사용하지 않는다(무시됨). 입금자 주소는 결제 시 온체인에서 기록된다. */
   payer_wallet?: string;
   /** 결제 체인 (예: eip155:8453). 단일 고정 — allowed_pay_chains와 상호 배타. */
   pay_chain?: string;
@@ -85,11 +89,19 @@ export interface CreateSessionParams {
    * 예: [{ chain: 'base', token: 'USDC' }, { chain: 'tron', token: 'USDT' }]
    */
   allowed_assets?: Array<{ chain: string; token: string }>;
-  /** 결제 자산 (예: USDC) */
+  /** @deprecated 서버가 사용하지 않는다(무시됨). 결제 자산은 `allowed_assets` 로 지정한다. */
   pay_asset?: string;
   /** 허용 오차 (%, 기본값: 2.00) */
   tolerance_percent?: string;
-  /** 만료 시간 (초, 기본값: 1800) */
+  /**
+   * 결제 대기 시간(분). 1~60, 기본 15. 이 시간이 지나면 세션이 만료된다
+   * (만료 후 도착한 정확 금액은 7일 안이면 늦은 결제로 인정 — `late: true`).
+   */
+  expires_in_minutes?: number;
+  /**
+   * @deprecated `expires_in_minutes` 를 쓴다. 60~3600 초만 허용되고 분 단위로 올림해 보낸다.
+   * (0.11 까지는 서버가 이 필드를 몰라 무시했고, 항상 기본 15분이 적용됐다.)
+   */
   expires_in_seconds?: number;
   /** 메타데이터 (모든 값은 string 이어야 함) */
   metadata?: Record<string, string>;
@@ -151,9 +163,18 @@ export interface PublicSession {
   status: string;
   mode: string | null;
   currency: string;
-  /** Atomic 정수 문자열(토큰 decimals 기준). */
+  /**
+   * 주문 총액 — **canonical μUSD(6dp) 정수 문자열**(가격 통화 기준, $1 = "1000000"). 결제 토큰 decimals 와 무관하다
+   * (18dp 토큰으로 결제해도 6dp). 온체인으로 보낼 토큰 단위 금액은 `pay_amount`(또는 발급 응답 `expectedAmount`).
+   */
   amount_total: string;
+  /** 지금까지 입금주소에 들어온 금액 — **결제 토큰 atomic**(`token_decimals` 기준). 미입금이면 null. */
   amount_received?: string | null;
+  /**
+   * 선택된 결제 토큰 단위의 총액(atomic, `token_decimals` 기준) — 구매자가 송금할 정확 금액. 자산 미선택이면 null.
+   * = canonicalToTokenAtomic(amount_total, token_decimals). 부족액 = pay_amount − amount_received.
+   */
+  pay_amount?: string | null;
   pay_chain: string | null;
   pay_asset: string | null;
   /** 발급된 주문별 forwarder 입금주소(미발급이면 null). */
@@ -162,7 +183,7 @@ export interface PublicSession {
   payment_options: PaymentOption[];
   chain_id: number | null;
   token_address: string | null;
-  /** 선택된 pay 토큰 decimals(발급 후). amount_total/amount_received atomic 해석에 사용 — 6dp 가정 금지. */
+  /** 선택된 pay 토큰 decimals(발급 후). amount_received / pay_amount 해석에 사용 — 6dp 가정 금지(amount_total 은 항상 6dp). */
   token_decimals?: number | null;
   tx_hash: string | null;
   release_tx_hash?: string | null;
@@ -312,16 +333,23 @@ export interface UpdateProductParams {
 
 /**
  * 가격 생성 입력. 금액은 둘 중 **하나** (line item 과 동일 모델):
- *   - `amount`(권장): 사람 표기 USD 문자열(예 "29", "0.5"). decimal 신경 쓸 필요 없음.
- *   - `amount_atomic`: raw μUSD 정수($1="1000000") — 고급/기존.
+ *   - `amount`(권장): 사람 표기 canonical 6dp 문자열(예 "29", "0.5"). decimal 신경 쓸 필요 없음.
+ *   - `amount_atomic`: raw canonical 6dp 정수($1="1000000") — 고급/기존.
  * 둘 다 지정하거나 둘 다 생략하면 서버가 400 을 반환한다.
+ *
+ * `amount`/`amount_atomic`은 실제 결제 토큰의 decimals 가 아니라 **항상 canonical 6dp**다 — 서버가
+ * 결제 시점에 실제 토큰 decimals(예: JPYC=18dp)로 재스케일한다(1:1 가정, 환율 변환 없음). 즉
+ * `token_symbol: 'JPYC'`로 "29"를 등록하면 29 JPYC(≈29엔)로 결제되지, 29 USD 상당의 JPYC로
+ * 환산되지 않는다.
+ *
+ * `currency`는 입력받지 않는다 — 서버가 `token_symbol`에서 파생한다(불일치 방지).
  */
 export interface CreatePriceParams {
-  /** 사람 표기 USD 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  /** 사람 표기 canonical 6dp 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
   amount?: string;
-  /** raw μUSD 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  /** raw canonical 6dp 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
   amount_atomic?: string;
-  currency?: string;
+  /** 'USDC' | 'USDT' | 'JPYC' — 미지정 시 'USDC'. 이 Price 의 유일한 결제 자산(currency 는 여기서 파생). */
   token_symbol?: string;
   billing_type?: 'one_time';
   nickname?: string;

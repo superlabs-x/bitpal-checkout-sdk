@@ -18,7 +18,8 @@
  * ```
  */
 
-export { BitPalCheckoutClient, BitPalError } from './client.js';
+export { BitPalCheckoutClient, BitPalError, parseApiErrorBody } from './client.js';
+export type { BitPalErrorDetails } from './client.js';
 export type {
   BitPalConfig,
   LineItem,

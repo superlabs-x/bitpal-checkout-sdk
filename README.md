@@ -13,23 +13,28 @@ pnpm add @bitpal/checkout
 
 ## Amounts — just pass a human number
 
-Use **`amount`** in line items — a plain USD string like `"20"`, `"0.5"`, `"29.00"`. No decimals to compute.
+Use **`amount`** in line items — a plain decimal string like `"20"`, `"0.5"`, `"29.00"`. No decimals to compute.
 
 ```ts
 line_items: [{ name: 'Pro', amount: '29', currency: 'USDC' }]
 ```
 
-**The amount is a USD price — it does NOT depend on the chain or token decimals.** Whether the buyer pays with USDC (6dp) on Base or USDT (18dp) on BNB, you pass the same `amount`. BitPal rescales to the buyer's chosen token at deposit time. So you never compute per-token decimals. (Prices via `prices.create` take the same `amount`.)
+**The amount is quoted in the line item's `currency` — it does NOT depend on the chain or token decimals.** `currency: 'USDC'` / `'USDT'` means a USD price; `currency: 'JPYC'` means a JPY price (`amount: '1500'` → 1,500 JPYC — there is no FX conversion). Whether the buyer pays USDC (6dp) on Base or USDT (18dp) on BNB, you pass the same `amount`; BitPal rescales to the buyer's chosen token at deposit time. (Prices via `prices.create` take the same `amount`; their currency comes from `token_symbol`.)
 
 <details><summary>Advanced: raw atomic amounts</summary>
 
-If you already hold **atomic μUSD integer strings** ($1 = `"1000000"`), pass `amount_atomic` instead (mutually exclusive with `amount`):
+If you already hold **canonical 6-decimal integer strings** (`"1"` = `"1000000"`), pass `amount_atomic` instead (mutually exclusive with `amount`):
 
 ```
-$1.00 → "1000000"   $29.00 → "29000000"   $0.50 → "500000"
+1.00 → "1000000"   29.00 → "29000000"   0.50 → "500000"
 ```
 
-Helpers for atomic conversion (e.g. reading `amount_total` back): `toAtomic(v, decimals)` / `fromAtomic(v, decimals)` — read `decimals` from `payment_options[]`/`token_decimals` (6 for USDC/USDT, 18 for BNB USDT). `toAtomicUSDC`/`fromAtomicUSDC` are 6dp shortcuts.
+Reading amounts back:
+
+- `amount_total` is **always canonical 6dp**, whatever token the buyer pays with — `fromAtomic(amount_total, 6)`.
+- `amount_received`, `pay_amount` (the exact amount the buyer must send) and the issued `expectedAmount` are in the **pay token's units** — use `token_decimals` (6 for USDC/USDT, 18 for BNB USDT / JPYC). Never assume 6dp for these.
+
+Helpers: `toAtomic(v, decimals)` / `fromAtomic(v, decimals)`; `toAtomicUSDC`/`fromAtomicUSDC` are 6dp shortcuts.
 </details>
 
 ## Environments
@@ -73,7 +78,7 @@ const { data: session } = await bitpal.checkout.createSession({
     { chain: 'tron',   token: 'USDT' },
     { chain: 'solana', token: 'USDC' },
   ],
-  expires_in_seconds: 1800,
+  expires_in_minutes: 30,
   success_url: 'https://yourstore.com/thanks',
 });
 
@@ -96,6 +101,10 @@ The buyer then sends the exact amount from **any wallet or exchange** — no wal
 signature; they pay their own network gas. A watcher detects the deposit and a keeper sweeps it to
 you.
 
+> **Call this from your backend.** Browsers on your own domain can only call `getPublicSession`
+> directly (CORS). Proxy `issueDepositAddress` / `getStatus` through your server — and never ship a
+> secret key to the browser.
+
 ```ts
 const { data } = await bitpal.checkout.issueDepositAddress(session.id, {
   session_token: session.session_token!, // from createSession
@@ -106,11 +115,13 @@ const { data } = await bitpal.checkout.issueDepositAddress(session.id, {
 });
 
 console.log(data.depositAddress);  // buyer sends the exact amount here
-console.log(data.expectedAmount);  // atomic μUSDC — display this exact amount
+console.log(data.expectedAmount);  // atomic, in the pay token's decimals — display this exact amount
 ```
 
-> `refundAddress` is committed into the deposit address and **cannot change** after issuance
-> (over / under / late payments auto-refund there on-chain).
+> `refundAddress` is committed into the deposit address and **cannot change** after issuance.
+> Overpaid excess, wrong tokens, and underpayments left at expiry are refunded there on-chain. A full
+> payment that arrives after the deadline (up to 7 days) is accepted as a **late payment** — the
+> `checkout.session.paid` webhook carries `late: true` so you can decide how to fulfil it.
 
 ### Poll status (buyer UX)
 
@@ -124,8 +135,9 @@ Polling is for buyer-facing UX. For **server-side** confirmation, trust the webh
 ### Preview the fee
 
 ```ts
-const { data: fee } = await bitpal.checkout.previewFee(toAtomicUSDC('29.00'));
-console.log(fromAtomicUSDC(fee.fee_amount)); // e.g. "0.43"
+const { data: fee } = await bitpal.checkout.previewFee('29.00');            // human amount
+// or: await bitpal.checkout.previewFee({ amountAtomic: '29000000' });       // raw 6dp
+console.log(fromAtomicUSDC(fee.fee_amount)); // response is atomic — e.g. "0.43"
 ```
 
 ## Webhooks
