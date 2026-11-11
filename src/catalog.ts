@@ -18,6 +18,7 @@
  */
 import type {
   ApiResponse,
+  IdempotencyOptions,
   ListResponse,
   CheckoutProduct,
   CheckoutPrice,
@@ -34,7 +35,7 @@ import type {
 } from './types.js';
 
 /** client.ts의 private request를 리소스에 주입하기 위한 시그니처 */
-export type CatalogRequester = <T>(method: string, path: string, body?: unknown) => Promise<T>;
+export type CatalogRequester = <T>(method: string, path: string, body?: unknown, options?: IdempotencyOptions) => Promise<T>;
 
 function toQuery(params?: object): string {
   if (!params) return '';
@@ -48,9 +49,9 @@ function toQuery(params?: object): string {
 export class ProductsResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/products */
-  create(params: CreateProductParams): Promise<ApiResponse<CheckoutProduct>> {
-    return this.request('POST', '/v1/checkout/products', params);
+  /** POST /v1/checkout/products — options.idempotencyKey 를 주면 Idempotency-Key 헤더로 보낸다(재시도 안전). */
+  create(params: CreateProductParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutProduct>> {
+    return this.request('POST', '/v1/checkout/products', params, options);
   }
 
   /** GET /v1/checkout/products */
@@ -72,9 +73,9 @@ export class ProductsResource {
 export class PricesResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/products/:id/prices */
-  create(productId: string, params: CreatePriceParams): Promise<ApiResponse<CheckoutPrice>> {
-    return this.request('POST', `/v1/checkout/products/${encodeURIComponent(productId)}/prices`, params);
+  /** POST /v1/checkout/products/:id/prices — options.idempotencyKey 지원. */
+  create(productId: string, params: CreatePriceParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutPrice>> {
+    return this.request('POST', `/v1/checkout/products/${encodeURIComponent(productId)}/prices`, params, options);
   }
 
   /** GET /v1/checkout/products/:id/prices */
@@ -116,9 +117,9 @@ export class PricesResource {
 export class PaymentLinksResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/payment-links */
-  create(params: CreatePaymentLinkParams): Promise<ApiResponse<CheckoutPaymentLink>> {
-    return this.request('POST', '/v1/checkout/payment-links', params);
+  /** POST /v1/checkout/payment-links — options.idempotencyKey 지원. */
+  create(params: CreatePaymentLinkParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutPaymentLink>> {
+    return this.request('POST', '/v1/checkout/payment-links', params, options);
   }
 
   /** GET /v1/checkout/payment-links */

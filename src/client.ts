@@ -17,8 +17,20 @@ import type {
   FeePreview,
   ApiResponse,
   ListResponse,
+  IdempotencyOptions,
 } from './types.js';
 import { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
+
+/**
+ * 멱등성 키 → `Idempotency-Key` 헤더. API 는 모든 머천트 POST 에서 같은 키의 재시도에 첫 응답을 돌려주고,
+ * 같은 키로 다른 method·path·body 를 보내면 422 를 낸다. 키가 없으면 헤더를 보내지 않는다(기존 동작).
+ */
+function idempotencyHeaders(options?: IdempotencyOptions): Record<string, string> | undefined {
+  const key = options?.idempotencyKey;
+  if (key === undefined) return undefined;
+  if (key.trim().length === 0) throw new Error('[BitPal] idempotencyKey must be a non-empty string.');
+  return { 'Idempotency-Key': key };
+}
 
 /**
  * line item one-of 검증 — 금액은 `amount`(사람 표기 canonical 6dp) XOR `amount_atomic`(raw canonical
@@ -38,6 +50,10 @@ const EXPIRY_MAX_MINUTES = 60;
 function resolveExpiryMinutes(minutes: number | undefined, seconds: number | undefined): number | undefined {
   if (minutes !== undefined && seconds !== undefined) {
     throw new Error("[BitPal] pass only one of `expires_in_minutes` or `expires_in_seconds`.");
+  }
+  // 초 단위 입력은 올림 전에 범위를 본다 — 1초가 1분으로 올림돼 통과하지 않게(문서: 60~3600초).
+  if (seconds !== undefined && (!Number.isFinite(seconds) || seconds < EXPIRY_MIN_MINUTES * 60 || seconds > EXPIRY_MAX_MINUTES * 60)) {
+    throw new Error(`[BitPal] session expiry must be ${EXPIRY_MIN_MINUTES}–${EXPIRY_MAX_MINUTES} minutes (expires_in_minutes) — got ${seconds}s.`);
   }
   const resolved = seconds !== undefined ? Math.ceil(seconds / 60) : minutes;
   if (resolved === undefined) return undefined;
@@ -79,14 +95,15 @@ export class BitPalCheckoutClient {
     this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
 
-    const requester = <T>(method: string, path: string, body?: unknown): Promise<T> =>
-      this.request<T>(method, path, body);
+    const requester = <T>(method: string, path: string, body?: unknown, options?: IdempotencyOptions): Promise<T> =>
+      this.request<T>(method, path, body, idempotencyHeaders(options));
     this.products = new ProductsResource(requester);
     this.prices = new PricesResource(requester);
     this.paymentLinks = new PaymentLinksResource(requester);
   }
 
   /* ─── 내부 HTTP ─── */
+
 
   private async request<T>(
     method: string,
@@ -160,7 +177,7 @@ export class BitPalCheckoutClient {
    * });
    * // 단일 체인 고정은 pay_chain 사용(둘은 상호 배타).
    */
-  async createSession(params: CreateSessionParams): Promise<ApiResponse<CheckoutSession>> {
+  async createSession(params: CreateSessionParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutSession>> {
     // pay_chain(단일 고정)과 allowed_pay_chains(다중 허용)는 상호 배타 — 서버도 막지만
     // SDK 사용자가 즉시 피드백 받도록 클라이언트에서 선제 차단.
     if (params.pay_chain && params.allowed_pay_chains && params.allowed_pay_chains.length > 0) {
@@ -185,6 +202,7 @@ export class BitPalCheckoutClient {
       'POST',
       '/v1/checkout/sessions',
       body,
+      idempotencyHeaders(options),
     );
     // Backend가 token 쿼리까지 포함한 정확한 URL을 `checkout_url`로 보낸다.
     // SDK는 mirror해서 `url`로도 노출 (backwards compat). 자체적으로 URL을 조립하지 않는 이유:
@@ -269,7 +287,7 @@ export class BitPalCheckoutClient {
   }
 
   /**
-   * 경량 상태 폴링 (`GET /v1/checkout/sessions/:id/status`) — 인증 불요.
+   * 경량 상태 폴링 (`GET /v1/checkout/sessions/:id/status`) — API 키 필요, 자기 세션만.
    *
    * status: awaiting_deposit → deposit_detected → paid_confirmed/swept. 확정/정산은 webhook 으로도
    * 통지되므로, 서버 사이드 확정은 webhook 을 신뢰(폴링은 buyer UX 용).

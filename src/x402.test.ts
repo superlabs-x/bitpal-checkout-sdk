@@ -210,6 +210,23 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
     expect(concurrent.kind).toBe('unconfirmed');
   });
 
+  it('network 대소문자만 바꾼 같은 authorization 은 같은 결제로 본다 (E9)', async () => {
+    stubFetch({
+      '/v1/x402/requirements': [REQUIREMENTS_OK],
+      '/v1/x402/verify': [VERIFY_OK],
+      '/v1/x402/settle': [SETTLE_OK],
+    });
+    const g = gate();
+    const first = await g.collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    expect(first.kind).toBe('settled');
+    // 서명은 network 문자열을 덮지 않는다 — 'Base' 로 바꿔 다시 보내도 같은 키여야 한다.
+    const recased = await g.collect({ header: encodePaymentHeader({ ...payload(), network: ' Base ' }), resource: RESOURCE });
+    expect(recased.kind).toBe('unconfirmed'); // 처리 중(commit 전) — 리소스 미지급
+    if (first.kind === 'settled') await first.commit();
+    const after = await g.collect({ header: encodePaymentHeader({ ...payload(), network: 'BASE' }), resource: RESOURCE });
+    expect(after.kind).toBe('already_used');
+  });
+
   it('nonce 가 다르면 별개 결제로 통과한다', async () => {
     stubFetch({
       '/v1/x402/requirements': [REQUIREMENTS_OK],

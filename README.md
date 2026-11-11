@@ -4,6 +4,8 @@ BitPal Checkout SDK — **non-custodial** crypto checkout. Create sessions, issu
 addresses, poll status, and verify signed webhooks. BitPal never custodies funds: each order gets a
 deposit address cryptographically committed to your wallet, and payments are swept directly to you.
 
+[Website](https://bitpal.io) · [Developer docs](https://bitpal.io/docs/) · [MCP server for AI coding tools](https://www.npmjs.com/package/@bitpal/mcp)
+
 ## Install
 
 ```bash
@@ -94,6 +96,12 @@ redirect(session.checkout_url!);
 
 `pay_chain` and `allowed_pay_chains` are mutually exclusive; `allowed_assets` takes precedence over both. Omit all three and it defaults to **one chain × the line-item currency**. `currency` on the line item is always the **price denomination** (what the amount is quoted in) — independent of which token the buyer pays with.
 
+**Safe retries** — pass an idempotency key (e.g. your order id) so a retried request returns the first session instead of creating a second one. Works the same on `products.create`, `prices.create` and `paymentLinks.create`. Reusing a key with a different body is rejected (`422`).
+
+```ts
+await bitpal.checkout.createSession({ line_items }, { idempotencyKey: `order-${order.id}` });
+```
+
 ### Self-hosted flow: issue a deposit address yourself
 
 If you render your own payment UI, issue the per-order deposit address and show it to the buyer.
@@ -126,7 +134,7 @@ console.log(data.expectedAmount);  // atomic, in the pay token's decimals — di
 ### Poll status (buyer UX)
 
 ```ts
-const { data } = await bitpal.checkout.getStatus(session.id); // no auth needed
+const { data } = await bitpal.checkout.getStatus(session.id); // server-side: needs your API key, own sessions only
 // status: awaiting_deposit → deposit_detected → paid_confirmed → swept
 ```
 

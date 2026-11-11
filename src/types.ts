@@ -91,7 +91,10 @@ export interface CreateSessionParams {
   allowed_assets?: Array<{ chain: string; token: string }>;
   /** @deprecated 서버가 사용하지 않는다(무시됨). 결제 자산은 `allowed_assets` 로 지정한다. */
   pay_asset?: string;
-  /** 허용 오차 (%, 기본값: 2.00) */
+  /**
+   * @deprecated 부족 결제는 수용하지 않는다 — "0" 만 허용, 그 외 값은 400.
+   *   부족하게 들어오면 `unresolved_underpaid` 가 되고 같은 주소로 나머지를 보내면 완료된다.
+   */
   tolerance_percent?: string;
   /**
    * 결제 대기 시간(분). 1~60, 기본 15. 이 시간이 지나면 세션이 만료된다
@@ -127,6 +130,29 @@ export interface CheckoutSession {
   settled_at: string | null;
   tx_hash: string | null;
   created_at: string;
+  /** 'TEST' | 'LIVE' — 조회(getSession/listSessions) 응답에 있다. */
+  mode?: 'TEST' | 'LIVE';
+  /** 지금까지 입금주소로 들어온 금액 — 결제 토큰 atomic(`token_decimals` 기준). */
+  amount_received?: string | null;
+  /** 결제 토큰 decimals(USDC/USDT=6, BSC-USD=18). amount_total 은 항상 6dp. */
+  token_decimals?: number | null;
+  payment_method?: string | null;
+  deposit_address?: string | null;
+  refund_address?: string | null;
+  /** 입금주소로 실제 들어온 토큰 컨트랙트/mint. */
+  received_token?: string | null;
+  deposit_tx_hash?: string | null;
+  sweep_tx_hash?: string | null;
+  fee_amount?: string | null;
+  fee_rate?: string | null;
+  net_amount?: string | null;
+  /** 수수료·정산액을 결제 토큰 자릿수(token_decimals) 그대로 — 온체인 금액과 정확히 같다. 발급 전 null. */
+  fee_amount_token?: string | null;
+  net_amount_token?: string | null;
+  success_url?: string | null;
+  cancel_url?: string | null;
+  metadata?: Record<string, unknown> | null;
+  payment_link_id?: string | null;
   /** 'hosted' — 결제 경로. 안2 는 hosted deposit-address 단일 경로. */
   payment_source?: string;
   /** 호스티드 결제 페이지 URL (token 쿼리 포함). backend 응답 그대로 사용 — buyer를 이 URL로 redirect. */
@@ -151,6 +177,15 @@ export interface PaymentOption {
   token_address: string;
   /** 토큰 decimals(USDC/USDT=6, BSC-USD=18). atomic↔decimal 변환에 필수 — 6dp 가정 금지. */
   decimals: number;
+  /** 이 토큰으로 보낼 정확 금액(atomic, 이 토큰의 decimals 기준). */
+  amount_atomic?: string;
+  /**
+   * false = 목록에는 보이지만 아직 선택할 수 없는 옵션(`unavailable_reason` 참고). 이 옵션으로 `issueDepositAddress` 를
+   * 호출하면 409 `CHECKOUT_CHAIN_COMING_SOON`. 0.13.0 에서 추가 — 이전 API 응답에는 없을 수 있어 optional.
+   */
+  available?: boolean;
+  /** 선택할 수 없는 이유. `coming_soon` = 이 네트워크는 곧 결제가 열린다. 선택 가능하면 null. */
+  unavailable_reason?: 'coming_soon' | null;
 }
 
 /**
@@ -179,6 +214,16 @@ export interface PublicSession {
   pay_asset: string | null;
   /** 발급된 주문별 forwarder 입금주소(미발급이면 null). */
   deposit_address?: string | null;
+  /**
+   * Solana 전용: 구매자가 받는 사람으로 넣을 지갑(owner) 주소 — 입금 토큰 계정(deposit_address)을 소유한 주문 계정.
+   * 지갑은 이 주소에서 토큰 계정을 도출하므로 이것을 수신자로 쓴다. EVM/Tron 은 null.
+   */
+  deposit_owner?: string | null;
+  /**
+   * 입금주소 발급 후: 그 주소로 보낸 송금을 정상 처리하는 마감(ISO, expires_at + grace ~90분). 미발급이면 null.
+   * expires_at 이 지나면 새 송금을 받지 말고(주소 비노출) 이 시각까지 확인을 기다린다.
+   */
+  payment_deadline_at?: string | null;
   /** 구매자 선택 가능한 결제 옵션(서버 권위). 단일-자산이면 1개. */
   payment_options: PaymentOption[];
   chain_id: number | null;
@@ -235,10 +280,12 @@ export interface DepositAddress {
   /** Unix seconds — on-chain deadline. */
   deadline: string;
   expiresAt: string | null;
+  /** Solana 전용: 수신자로 넣을 지갑(owner) 주소(`PublicSession.deposit_owner` 와 같음). EVM/Tron 은 null. */
+  depositOwner?: string | null;
 }
 
 /**
- * `getStatus()` (`GET /v1/checkout/sessions/:id/status`) 응답 — 경량 폴링용(인증 불요).
+ * `getStatus()` (`GET /v1/checkout/sessions/:id/status`) 응답 — 경량 폴링용(API 키, 자기 세션만).
  */
 export interface SessionStatus {
   status: string;
@@ -275,9 +322,18 @@ export interface ApiResponse<T> {
   error?: string;
 }
 
+/** 목록 응답 meta — total 은 필터 조건에 맞는 전체 개수(페이지 무관). */
+export interface ListMeta {
+  total?: number;
+  limit?: number;
+  offset?: number;
+  mode?: 'TEST' | 'LIVE';
+  requestId?: string | null;
+}
+
 export interface ListResponse<T> {
   data: T[];
-  total?: number;
+  meta?: ListMeta;
 }
 
 // ── Product / immutable Price 관리 (server-side) ──

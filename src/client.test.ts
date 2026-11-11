@@ -184,3 +184,49 @@ describe('@bitpal/checkout - createSession allowed_pay_chains (MULTICHAIN-MERCHA
   });
 
 });
+
+describe('@bitpal/checkout — Idempotency-Key (릴리스 리뷰 R5)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function stubHeaders(seen: Array<Record<string, string>>) {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      seen.push({ ...(init.headers as Record<string, string>) });
+      return new Response(JSON.stringify({ data: { id: 'x', status: 'created' } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+  }
+
+  const lineItems = [{ name: 'A', amount: '1', currency: 'USDC' }];
+
+  it('createSession 에 idempotencyKey 를 주면 헤더로 보낸다', async () => {
+    const seen: Array<Record<string, string>> = [];
+    stubHeaders(seen);
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await client.createSession({ line_items: lineItems }, { idempotencyKey: 'order-42' });
+    expect(seen[0]!['Idempotency-Key']).toBe('order-42');
+  });
+
+  it('키가 없으면 헤더를 보내지 않는다(기존 동작)', async () => {
+    const seen: Array<Record<string, string>> = [];
+    stubHeaders(seen);
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await client.createSession({ line_items: lineItems });
+    expect(seen[0]!['Idempotency-Key']).toBeUndefined();
+  });
+
+  it('상품·가격·결제 링크 생성도 idempotencyKey 를 헤더로 보낸다', async () => {
+    const seen: Array<Record<string, string>> = [];
+    stubHeaders(seen);
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await client.products.create({ name: 'P' } as never, { idempotencyKey: 'k1' });
+    await client.prices.create('prod_1', { unit_amount: '1', currency: 'USDC' } as never, { idempotencyKey: 'k2' });
+    await client.paymentLinks.create({ line_items: [] } as never, { idempotencyKey: 'k3' });
+    expect(seen.map((h) => h['Idempotency-Key'])).toEqual(['k1', 'k2', 'k3']);
+  });
+
+  it('빈 문자열 키는 거부한다', async () => {
+    const client = new BitPalCheckoutClient({ apiKey: 'bp_test_1', baseUrl: 'http://api.test' });
+    await expect(client.createSession({ line_items: lineItems }, { idempotencyKey: ' ' })).rejects.toThrow(/idempotencyKey/);
+  });
+});

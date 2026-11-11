@@ -44,6 +44,8 @@ describe('createSession — session expiry', () => {
     await expect(client().createSession({ line_items: lineItems, expires_in_minutes: 61 })).rejects.toThrow(/1–60 minutes/);
     await expect(client().createSession({ line_items: lineItems, expires_in_seconds: 7200 })).rejects.toThrow(/1–60 minutes/);
     await expect(client().createSession({ line_items: lineItems, expires_in_minutes: 0 })).rejects.toThrow(/1–60 minutes/);
+    await expect(client().createSession({ line_items: lineItems, expires_in_seconds: 1 })).rejects.toThrow(/1–60 minutes/); // 올림으로 통과하지 않게
+    await expect(client().createSession({ line_items: lineItems, expires_in_seconds: 59 })).rejects.toThrow(/1–60 minutes/);
     await expect(
       client().createSession({ line_items: lineItems, expires_in_minutes: 10, expires_in_seconds: 600 }),
     ).rejects.toThrow(/only one/);

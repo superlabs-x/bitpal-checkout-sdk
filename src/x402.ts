@@ -108,6 +108,14 @@ export interface X402PaymentPayload {
   };
 }
 
+/**
+ * x402 network 이름 정규화 — API(lib/x402-network)와 같은 규칙(trim·소문자·'-'→'_'). 재사용 차단 키에 쓴다.
+ * 'Base', ' base ', 'base' 는 같은 체인이고 서명은 network 문자열을 덮지 않으므로 같은 키가 되어야 한다.
+ */
+export function normalizeX402Network(network: string): string {
+  return network.trim().toLowerCase().replace(/-/g, '_');
+}
+
 /* ─── 재사용 차단 store ─── */
 
 /** `ok` = 이번 호출이 최초 점유 / `inflight` = 다른 요청이 처리 중 / `used` = 이미 리소스를 내줌. */
@@ -321,8 +329,9 @@ export class X402Gate {
       return this.paymentRequired(resource, 'MALFORMED_PAYMENT_HEADER');
     }
 
-    // 키 스코프는 EIP-3009 의 온체인 유일성 스코프와 같다(network + from + nonce).
-    const key = `${payload.network}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`;
+    // 키 스코프는 EIP-3009 의 온체인 유일성 스코프와 같다(network + from + nonce). network 는 API 와 같은 규칙으로
+    //   정규화한다 — 서명에 network 문자열이 들어가지 않아 'Base'·'base' 로 같은 authorization 을 두 번 점유할 수 있었다(E9).
+    const key = `${normalizeX402Network(payload.network)}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`;
     const claim = await this.store.claim(key, this.maxTimeoutSeconds);
     if (claim === 'used') {
       return {
