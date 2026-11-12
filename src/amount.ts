@@ -1,20 +1,20 @@
 /**
- * amount.ts — atomic ↔ decimal 변환 헬퍼 (임의 decimals + USDC 하위호환)
+ * amount.ts — atomic <-> decimal conversion helpers (any decimals, plus USDC aliases)
  *
- * BitPal API는 모든 amount를 atomic 정수 문자열로 받는다. decimals 는 토큰마다 다르다:
- *   USDC/USDT(Base/Arb/Tron/Solana) = 6, BSC-USD(BNB USDT) = 18. → payment_options[].decimals /
- *   PublicSession.token_decimals 로 서버가 내려준다. 6dp 를 하드코딩하면 non-6dp 토큰에서 금액이 틀린다.
+ * The BitPal API takes every amount as an atomic integer string. Decimals differ per token:
+ *   USDC/USDT (Base/Arbitrum/Tron/Solana) = 6, BSC-USD (BNB USDT) = 18. The server returns them in
+ *   payment_options[].decimals / PublicSession.token_decimals. Hardcoding 6dp gives wrong amounts for non-6dp tokens.
  *
- * 정밀도 손실 방지를 위해 BigInt 연산만 사용한다 (Number 변환 금지 — CLAUDE.md 정책).
+ * Only BigInt arithmetic is used, to avoid precision loss (never converted to Number).
  *   $1(6dp)   → "1000000"     $1(18dp) → "1000000000000000000"
  */
 
 /**
- * decimal 문자열 → atomic 문자열 (임의 decimals).
+ * Decimal string -> atomic string (any decimals).
  *
- * @param decimal 소수 문자열(음수 불가, 소수 자리 ≤ decimals)
- * @param decimals 토큰 decimals (예: 6, 18). payment_options[].decimals 사용.
- * @throws {Error} 음수, decimals 초과 소수 자리, 형식 오류
+ * @param decimal Decimal string (non-negative, at most `decimals` fractional digits)
+ * @param decimals Token decimals (e.g. 6, 18). Use payment_options[].decimals.
+ * @throws {Error} On negatives, too many fractional digits, or malformed input
  * @example toAtomic('29.00', 6) // '29000000'   toAtomic('1.5', 18) // '1500000000000000000'
  */
 export function toAtomic(decimal: string, decimals: number): string {
@@ -32,10 +32,10 @@ export function toAtomic(decimal: string, decimals: number): string {
 }
 
 /**
- * atomic 문자열 → 사람이 읽기 좋은 decimal 문자열 (임의 decimals).
- * 최소 2자리 소수를 유지하되(예: '29.00'), decimals 만큼만 노출.
+ * Atomic string -> human-readable decimal string (any decimals).
+ * Keeps at least 2 fractional digits (e.g. '29.00') and at most `decimals`.
  *
- * @throws {Error} 정수 문자열이 아니면
+ * @throws {Error} If the input is not an integer string
  * @example fromAtomic('29000000', 6) // '29.00'   fromAtomic('1500000000000000000', 18) // '1.50'
  */
 export function fromAtomic(atomic: string, decimals: number): string {
@@ -55,8 +55,8 @@ export function fromAtomic(atomic: string, decimals: number): string {
 }
 
 /**
- * decimal → atomic μUSDC (6dp). 하위호환 별칭 — 새 코드는 `toAtomic(decimal, decimals)` 권장
- *   (BNB USDT=18dp 등 non-6dp 토큰은 이 헬퍼로 처리 불가).
+ * decimal -> atomic μUSDC (6dp). Backward-compatible alias — prefer `toAtomic(decimal, decimals)` in new code
+ *   (it cannot handle non-6dp tokens such as BNB USDT = 18dp).
  * @example toAtomicUSDC('29.00') // '29000000'
  */
 export function toAtomicUSDC(decimal: string): string {
@@ -64,7 +64,7 @@ export function toAtomicUSDC(decimal: string): string {
 }
 
 /**
- * atomic μUSDC(6dp) → decimal. 하위호환 별칭 — 새 코드는 `fromAtomic(atomic, decimals)` 권장.
+ * atomic μUSDC (6dp) -> decimal. Backward-compatible alias — prefer `fromAtomic(atomic, decimals)` in new code.
  * @example fromAtomicUSDC('29000000') // '29.00'
  */
 export function fromAtomicUSDC(atomic: string): string {

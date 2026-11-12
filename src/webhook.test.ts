@@ -197,3 +197,32 @@ describe('@bitpal/checkout — backend round-trip simulation', () => {
     expect(parsed.id).toBe('evt_round_trip');
   });
 });
+
+describe('@bitpal/checkout — WebhookEvent union (S-13)', () => {
+  it('narrows data by event and keeps WebhookPayload assignable', () => {
+    const body = JSON.stringify({
+      id: 'evt_2',
+      event: 'checkout.session.paid',
+      created_at: '2026-11-12T00:00:00.000Z',
+      data: { session_id: 'cs_1', amount_total: '1000000', currency: 'USDC', late: false, metadata: { order_id: 'o1' } },
+    });
+    const ev = parseWebhookEvent(body);
+    const legacy: WebhookPayload = ev; // non-breaking: still assignable to the old envelope type
+    expect(legacy.id).toBe('evt_2');
+    if (ev.event === 'checkout.session.paid') {
+      const late: boolean | undefined = ev.data.late;
+      const orderId: unknown = ev.data.metadata.order_id;
+      expect(late).toBe(false);
+      expect(orderId).toBe('o1');
+    } else {
+      throw new Error('expected paid');
+    }
+    const refund = parseWebhookEvent(
+      JSON.stringify({ id: 'evt_3', event: 'checkout.refund.recorded', created_at: '2026-11-12T00:00:00.000Z', data: { session_id: 'cs_1', metadata: {}, kind: 'merchant', amount: '1', token: 't', tx_hash: 'h', refund_address: 'r' } }),
+    );
+    if (refund.event === 'checkout.refund.recorded') {
+      const k: string = refund.data.kind;
+      expect(k).toBe('merchant');
+    }
+  });
+});

@@ -1,19 +1,19 @@
 /**
- * x402-pay — payer 측 헬퍼. 402 응답을 받아 `X-PAYMENT` 헤더를 만들어 준다.
+ * x402-pay — payer-side helper. Takes a 402 response and builds the `X-PAYMENT` header.
  *
- * BitPal 의 402 는 수수료를 forwarder 컨트랙트 없이 나누기 위해 authorization 을 두 개 요구한다
- * (머천트 몫 + 플랫폼 수수료 몫). 순정 x402 클라이언트는 그 확장(`feeBreakdown`)을 모르므로,
- * payer 쪽에서 그 차이를 흡수하는 게 이 파일의 존재 이유다. `feeBreakdown` 이 없는 평범한 402 도
- * 그대로 처리한다 — 그 경우 authorization 하나만 만든다.
+ * BitPal's 402 can carry a fee extension (`feeBreakdown`: merchant share + platform fee share)
+ * that stock x402 clients don't know about; this helper absorbs that difference on the payer side.
+ * A plain 402 without `feeBreakdown` works as well. Either way, a single authorization is produced
+ * (see `createX402Payment`).
  *
- * 서명은 직접 하지 않는다. 지갑/키가 있는 쪽에서 `signTypedData` 하나만 넘기면 되고, 그래서 이
- * SDK 는 암호 라이브러리 의존이 없다(viem / ethers / 브라우저 지갑 전부 몇 줄로 연결된다).
+ * It does not sign by itself. Pass a `signTypedData` from whatever holds the wallet/key, so this
+ * SDK has no crypto library dependency (viem / ethers / browser wallets connect in a few lines).
  */
 
 import type { Eip3009Authorization, X402Accept, X402PaymentPayload, X402Requirements } from './x402.js';
 import { encodePaymentHeader } from './x402.js';
 
-/** EIP-3009 `TransferWithAuthorization` 의 EIP-712 타입 정의. */
+/** EIP-712 type definition for EIP-3009 `TransferWithAuthorization`. */
 export const TRANSFER_WITH_AUTHORIZATION_TYPES = {
   TransferWithAuthorization: [
     { name: 'from', type: 'address' },
@@ -47,7 +47,7 @@ export interface X402TypedDataRequest {
 }
 
 /**
- * EIP-712 서명자. 65바이트 `0x…` 서명 문자열을 돌려주면 된다.
+ * EIP-712 signer. Must return a 65-byte `0x…` signature string.
  *
  * @example viem
  * ```ts
@@ -61,34 +61,34 @@ export interface X402TypedDataRequest {
 export type X402Signer = (request: X402TypedDataRequest) => Promise<string> | string;
 
 export interface CreateX402PaymentOptions {
-  /** 402 응답 바디 전체, 또는 그 안의 `accepts[]` 한 칸. */
+  /** The full 402 response body, or a single `accepts[]` entry. */
   requirements: X402Requirements | X402Accept;
-  /** 지불자 주소. 서명자와 같은 주소여야 한다(서버가 recover 로 대조). */
+  /** Payer address. Must match the signer (the server verifies it by signature recovery). */
   from: string;
   signTypedData: X402Signer;
   /**
-   * 서명 유효시간(초). 기본은 402 의 `maxTimeoutSeconds`.
-   * BitPal 은 60초 미만·3600초 초과를 거부한다.
+   * Signature validity in seconds. Defaults to the 402's `maxTimeoutSeconds`.
+   * BitPal rejects values below 60 or above 3600 seconds.
    */
   validForSeconds?: number;
-  /** 테스트에서 고정하기 위한 훅. 기본은 `Date.now()`. */
+  /** Test hook for a fixed clock. Defaults to `Date.now()`. */
   now?: () => number;
-  /** 테스트에서 고정하기 위한 훅. 기본은 CSPRNG 32바이트. */
+  /** Test hook for a fixed nonce. Defaults to 32 CSPRNG bytes. */
   randomNonce?: () => string;
 }
 
 export interface X402PaymentResult {
-  /** 그대로 `X-PAYMENT` 헤더에 넣으면 되는 base64 문자열. */
+  /** Base64 string to put directly in the `X-PAYMENT` header. */
   header: string;
   payload: X402PaymentPayload;
-  /** 지갑에서 실제로 빠져나가는 총액(머천트 몫 + 수수료 몫). */
+  /** Total amount leaving the wallet (merchant share + fee share). */
   totalAmount: string;
 }
 
 /**
- * 서버가 요구하는 범위는 60~3600초지만, payer 는 **로컬 시계**로 validBefore 를 만든다.
- * 60 에 딱 맞추면 네트워크 왕복 + 서버 시계가 1초만 앞서도 `validBefore >= now+60` 에서 거부되므로
- * 서명 낭비를 막기 위해 마진을 둔 하한을 쓴다.
+ * The server accepts 60–3600 seconds, but the payer computes validBefore from its **local clock**.
+ * Using exactly 60 would be rejected at `validBefore >= now+60` if the round trip or server clock is even 1 s ahead,
+ * so a lower bound with a safety margin is used to avoid wasted signatures.
  */
 const CLOCK_SKEW_MARGIN_SECONDS = 30;
 const SERVER_MIN_VALIDITY_SECONDS = 60;
@@ -96,11 +96,11 @@ const MIN_VALIDITY_SECONDS = SERVER_MIN_VALIDITY_SECONDS + CLOCK_SKEW_MARGIN_SEC
 const MAX_VALIDITY_SECONDS = 3600;
 
 /**
- * 402 응답 → 서명된 `X-PAYMENT` 헤더.
+ * 402 response -> signed `X-PAYMENT` header.
  *
- * 수수료가 있으면 서명 프롬프트가 두 번 뜬다(머천트 몫 1건, 수수료 몫 1건). 두 authorization 은
- * 같은 유효창을 쓴다 — 수수료 쪽이 먼저 만료되면 머천트 정산 뒤 수수료만 못 걷히기 때문에
- * 서버가 "수수료 창이 결제 창을 덮을 것"을 요구한다.
+ * Requires one signature: the full gross amount goes to the `payTo` forwarder address, which splits
+ * any platform fee on-chain. The validity window is taken from the 402 (or `validForSeconds`)
+ * and kept within the server's 60–3600 s range.
  *
  * @example
  * ```ts
@@ -137,15 +137,15 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
     throw new Error('[BitPal] x402: the 402 response is missing extra.chainId — cannot build the EIP-712 domain.');
   }
 
-  // validAfter=0 이면 "언제부터든 유효" 라 payer/서버 시계 오차에 걸리지 않는다.
+  // validAfter=0 means "valid from any time", so payer/server clock skew does not matter.
   const validAfter = '0';
   const validBefore = String(now + validFor);
   const nonce = (options.randomNonce ?? randomNonce)();
 
-  // **서명은 1건이다.** `payTo` 는 머천트 지갑이 아니라 분배 조건을 CREATE2 로 커밋한 포워더
-  //   주소이고, 거기로 gross 전액을 보낸다. 수수료를 쪼개는 건 그 주소가 온체인에서 한다.
-  //   그래서 payer 는 `feeBreakdown` 을 읽을 필요가 없다 — 순정 x402 클라이언트도 이 402 로
-  //   똑같이 결제할 수 있다는 뜻이다.
+  // **One signature.** `payTo` is not the merchant wallet but a forwarder address that commits the split
+  //   terms via CREATE2; the full gross amount goes there and that address splits the fee on-chain.
+  //   So the payer never needs to read `feeBreakdown` — a stock x402 client can pay this 402
+  //   the same way.
   const authorization: Eip3009Authorization = {
     from: options.from,
     to: accept.payTo,
@@ -178,7 +178,7 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
   };
 }
 
-/* ─── 내부 ─── */
+/* ─── Internal ─── */
 
 function resolveAccept(input: X402Requirements | X402Accept): X402Accept {
   if ('accepts' in input) {
@@ -190,21 +190,21 @@ function resolveAccept(input: X402Requirements | X402Accept): X402Accept {
 }
 
 /**
- * 서명 → `{v, r, s}`. BitPal API 가 요구하는 분해 형태.
+ * Signature -> `{v, r, s}`, the split form the BitPal API expects.
  *
- * 65바이트(r‖s‖v)와 64바이트 EIP-2098 compact(r‖yParityAndS) 둘 다 받는다 — viem 의
- * `signTypedData` 는 65바이트를 주지만 일부 지갑·라이브러리는 compact 를 돌려준다.
+ * Accepts both 65-byte (r‖s‖v) and 64-byte EIP-2098 compact (r‖yParityAndS) signatures — viem's
+ * `signTypedData` returns 65 bytes, but some wallets/libraries return the compact form.
  */
 /**
- * 지갑이 돌려준 서명을 **65바이트 packed hex** 로 수렴시킨다. x402 표준이 그 형태다.
+ * Normalizes a wallet signature to **65-byte packed hex**, the x402 standard form.
  *
- * 두 가지를 정규화한다:
- *   - EIP-2098 compact(64바이트) — 일부 지갑이 이걸 낸다. s 의 최상위 비트가 yParity 라 떼어내고
- *     v 를 복원해 65바이트로 편다.
- *   - v 가 0/1 인 경우 — 온체인 ecrecover 규약인 27/28 로 맞춘다.
+ * Handles two cases:
+ *   - EIP-2098 compact (64 bytes), emitted by some wallets. The top bit of s is yParity; it is stripped and
+ *     v is restored to expand to 65 bytes.
+ *   - v of 0/1 — mapped to 27/28, the on-chain ecrecover convention.
  *
- * 서버가 130 hex 만 받으므로 여기서 안 맞추면 그쪽에서 거부된다. 그 외 값은 recover 가 어긋나
- * 어차피 실패하므로 여기서 끊는다.
+ * The server only accepts 130 hex chars, so anything not normalized here would be rejected there. Other values
+ * would fail recovery anyway, so they are rejected here.
  */
 export function normalizeSignature(signature: string): string {
   const hex = signature.startsWith('0x') ? signature.slice(2) : signature;
@@ -229,7 +229,7 @@ export function normalizeSignature(signature: string): string {
   throw new Error(`[BitPal] x402: unexpected signature v=${raw} (expected 0, 1, 27 or 28).`);
 }
 
-/** CSPRNG 32바이트 nonce. EIP-3009 는 nonce 가 서명자별로 유일하기만 하면 된다. */
+/** 32-byte CSPRNG nonce. EIP-3009 only requires the nonce to be unique per signer. */
 function randomNonce(): string {
   const g = globalThis as { crypto?: { getRandomValues?<T extends ArrayBufferView>(a: T): T } };
   if (!g.crypto?.getRandomValues) {

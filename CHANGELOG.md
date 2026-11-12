@@ -4,6 +4,36 @@ All notable changes to `@bitpal/checkout`. Versions follow [semver](https://semv
 
 Source of truth: the BitPal monorepo (`packages/checkout-sdk`). The public repo `superlabs-x/bitpal-checkout-sdk` mirrors it.
 
+## Unreleased
+
+_Nothing yet._
+
+## 0.14.0 — 2026-11-12
+
+No breaking change in the SDK itself. Two API value changes to check if you store them: Tron `payer_wallet` / `received_token` now come back as base58 `T…` (were `0x` hex), and `tx_hash` is no longer always `null` (it mirrors `deposit_tx_hash`).
+
+### Added
+- `CreateSessionParams.late_payments` (`'accept'` default | `'refund'`) and `CheckoutSession.late_payments`. With `'refund'`, a full payment that arrives after the payment deadline is never accepted; it is refunded automatically to the buyer about 7 days after the deadline (refund kind `late_deposit`) — the non-custodial deposit contract does not allow an earlier refund.
+- Types `CheckoutRefundKind` (now including `merchant`) and `CheckoutRefundRecord` (the `checkout.refund.recorded` data, with optional `from_address` and `reason_code` for `merchant` refunds).
+- No refund method, by design: BitPal is non-custodial. Refund a completed payment in the console (Sessions → session → Refund — send from your own wallet and record the transaction); BitPal verifies it on-chain and sends `checkout.refund.recorded` with `kind: "merchant"`.
+- `WebhookEvent` — the webhook envelope as a discriminated union on `event`, with typed `data` per event (`CheckoutSessionPaidData`, `CheckoutSessionUnresolvedData`, `CheckoutRefundRecordedData`, … and `WebhookEventDataMap`). `parseWebhookEvent()` now returns it; the result is still assignable to `WebhookPayload`, and every `data` type keeps an index signature, so existing `event.data.foo` code compiles unchanged. `WebhookPayload` takes an optional event-name type parameter.
+- `CheckoutSession.received_token_symbol` (symbol of `received_token`, which is an address).
+
+### Changed
+- Published type docs (`.d.ts`) are now English-only, and internal local-development notes were removed. The `verifyWebhookSignature` docs now state the real signed string: `HMAC-SHA256(secret, "<X-Webhook-Timestamp>.<raw body>")` (the implementation was already correct).
+- `CheckoutSession.tx_hash` is marked `@deprecated` — use `deposit_tx_hash` / `sweep_tx_hash`.
+- `x402()` JSDoc example: `amount` is human-readable, so the "$1 per call" example now uses `amount: '1'` (it showed `'1000000'`).
+
+### API (applies to every SDK version once the API is deployed)
+- Every webhook's `data` now includes `metadata` — the metadata you set when creating the session (`{}` if none). BitPal's reserved keys (`_bitpal`, `payer_email`, `allowed_pay_chains`, `allowed_assets`) are not included.
+- Session responses add `received_token_symbol`. `tx_hash` (a legacy field that was always `null`) now returns the same value as `deposit_tx_hash` and is deprecated. Tron `payer_wallet` / `received_token` are returned as base58 `T…` addresses (they used to come back as `0x` hex).
+- The `CHECKOUT_AMOUNT_TOO_LOW` message now names the session currency ("Minimum checkout total is 1.00 USDC …"); the minimum itself (1.00 in the session currency) is unchanged and now documented.
+- `checkout.refund.recorded` can carry `kind: "merchant"` (plus `from_address`, `reason_code`) for refunds you record in the console. Treat unknown `kind` values as a generic refund. `GET /v1/checkout/sessions/{id}/refunds` lists them too, with `from_address`, `reason_code`, `note` and `explorer_url`.
+- Every error body now has the standard shape `{ error, code, retryable, trace_id }`, including errors some endpoints used to build by hand. Where `error` used to hold a code (`{ error: 'NOT_FOUND', message }`), `code` now holds it and `error` holds the message (`message` is kept too). Branch on `BitPalError.code`, not on `error.message`.
+- `POST /v1/checkout/sessions/:id/resolve` is removed (`404`). Underpaid and overpaid sessions are handled automatically — an underpayment completes if the buyer sends the rest before the payment deadline and is otherwise refunded to the buyer, an overpayment settles and the excess is refunded — and the session's `unresolved` state only reports what happened. The SDK never exposed this endpoint.
+- Webhook endpoints: `subscribed_events` only accepts published event names (`checkout.session.*`, `checkout.refund.recorded`, `x402.payment.resolved`) or `*`; anything else is a `400`. Duplicates are dropped.
+- `GET /health` now returns only `status`, `db` and `uptime_seconds`.
+
 ## 0.13.0 — 2026-11-11
 
 ### Breaking (API — applies to every SDK version once the API is deployed)

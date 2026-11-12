@@ -1,6 +1,6 @@
 {
   "name": "@bitpal/checkout",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "BitPal Checkout SDK — non-custodial crypto checkout: create sessions, issue per-order deposit addresses, poll status, verify signed webhooks, and charge per API call with x402.",
   "license": "MIT",
   "repository": {
@@ -57,6 +57,7 @@
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "lint": "tsc --noEmit",
     "test": "vitest run",
+    "check:dts": "node scripts/check-dts.mjs",
     "prepublishOnly": "npm test && npm run build",
     "release": "npm publish --access public"
   },

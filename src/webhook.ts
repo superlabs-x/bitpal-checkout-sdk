@@ -1,11 +1,12 @@
 /**
- * @bitpal/checkout — Webhook 서명 검증 + 이벤트 타입
+ * @bitpal/checkout — webhook signature verification and event types.
  *
- * BitPal 이 보내는 canonical webhook contract(envelope/서명/헤더)와 1:1 정합한다.
+ * Matches the envelope, signature and headers BitPal sends.
  */
+import type { CheckoutRefundRecord } from './types.js';
 
 /**
- * BitPal 이 발송하는 webhook 이벤트 타입 전체 목록.
+ * Every webhook event name BitPal sends.
  */
 export const CHECKOUT_WEBHOOK_EVENTS = [
   'checkout.session.created',
@@ -15,31 +16,149 @@ export const CHECKOUT_WEBHOOK_EVENTS = [
   'checkout.session.expired',
   'checkout.session.unresolved',
   'checkout.refund.recorded',
-  // x402 결제의 **사후** 확정. 정상 경로(/settle 이 그 자리에서 결과를 반환)는 발행되지 않는다 —
-  //   이미 아는 결과를 중복으로 받지 않게 하기 위함이다. /settle 이 503 을 반환해 결과를 모른 채
-  //   남았을 때, reconciler 가 체인을 보고 종결시키면 이 이벤트가 온다.
-  //   payload: { payment_id, status: 'confirmed'|'reverted'|'expired', tx_hash, resource, amount, … }
+  // Sent only for an x402 payment whose `/settle` answered 503 (outcome unknown at the time), once it is resolved
+  // on-chain. The normal path returns the result inline and does not send this event.
   'x402.payment.resolved',
 ] as const;
 
 export type CheckoutWebhookEvent = (typeof CHECKOUT_WEBHOOK_EVENTS)[number];
 
 /**
- * Canonical envelope (HTTP body).
- * Backend `CanonicalWebhookEnvelope`와 동일 shape.
+ * Webhook envelope (HTTP body), with `data` loosely typed.
+ * For per-event `data` types use {@link WebhookEvent} (what {@link parseWebhookEvent} returns) and narrow on `event`.
  */
-export interface WebhookPayload {
-  /** event_id (replay 시 원본 보존) */
+export interface WebhookPayload<E extends CheckoutWebhookEvent = CheckoutWebhookEvent> {
+  /** Event id. Deduplicate on it — unchanged on retries and replays. Test events start with `test_`. */
   id: string;
-  /** canonical event name */
-  event: CheckoutWebhookEvent;
-  /** envelope 생성 시각 (ISO) */
+  /** Event name. */
+  event: E;
+  /** When the event happened (ISO 8601, unchanged on retries). */
   created_at: string;
-  /** 이벤트별 payload */
+  /** Event data. */
   data: Record<string, unknown>;
 }
 
-/** Backend가 보내는 canonical 헤더 이름 */
+/**
+ * The `metadata` you set when creating the session (`{}` if none). BitPal's reserved keys (`_bitpal`, `payer_email`,
+ * `allowed_pay_chains`, `allowed_assets`) are not included.
+ */
+export type WebhookSessionMetadata = Record<string, unknown>;
+
+/** Fields every `checkout.session.*` event carries. More fields may be added. */
+export interface CheckoutSessionEventBase {
+  session_id: string;
+  /** Your session metadata. */
+  metadata: WebhookSessionMetadata;
+  /** Session total, 6-decimal integer string ("1000000" = 1). */
+  amount_total: string;
+  currency: string;
+  /** `true` when the full amount arrived after the payment window. */
+  late?: boolean;
+  [key: string]: unknown;
+}
+
+/** `checkout.session.created` */
+export type CheckoutSessionCreatedData = CheckoutSessionEventBase;
+
+/**
+ * `checkout.session.deposit_detected` — funds seen, waiting for confirmations. Optional: skipped when the deposit is
+ * already confirmed the first time BitPal sees it, so never wait for it.
+ */
+export interface CheckoutSessionDepositDetectedData extends CheckoutSessionEventBase {
+  tx_hash: string;
+  /** Atomic amount in the pay token's own decimals. */
+  amount_received: string;
+  /** Token contract / mint address actually received (not the symbol). */
+  received_token: string;
+}
+
+/** `checkout.session.paid` — confirmed, safe to fulfil. */
+export interface CheckoutSessionPaidData extends CheckoutSessionEventBase {
+  tx_hash?: string;
+}
+
+/** `checkout.session.settled` — swept to your payout wallet. */
+export interface CheckoutSessionSettledData extends CheckoutSessionEventBase {
+  sweep_tx_hash?: string;
+}
+
+/** `checkout.session.unresolved` — see `reason`. */
+export interface CheckoutSessionUnresolvedData extends CheckoutSessionEventBase {
+  reason: 'underpaid' | 'overpaid' | 'wrong_token' | 'reorg' | (string & {});
+  /** `underpaid`: the expected amount in the pay token's decimals. */
+  amount_expected?: string;
+  amount_received?: string;
+  received_token?: string;
+  tx_hash?: string;
+}
+
+/** `checkout.session.expired` — the deadline passed without a full payment. */
+export interface CheckoutSessionExpiredData extends CheckoutSessionEventBase {
+  /** Set when nothing was paid. */
+  reason?: 'no_deposit' | (string & {});
+  expired_at?: string;
+  source?: 'lazy' | 'cron' | (string & {});
+  /** Set when a partial payment was refunded. */
+  refund_tx_hash?: string;
+}
+
+/** `checkout.refund.recorded` */
+export interface CheckoutRefundRecordedData extends CheckoutRefundRecord {
+  session_id: string;
+  /** Your session metadata. */
+  metadata: WebhookSessionMetadata;
+  [key: string]: unknown;
+}
+
+/** `x402.payment.resolved` */
+export interface X402PaymentResolvedData {
+  payment_id: string;
+  status: 'confirmed' | 'reverted' | 'expired';
+  resource: string;
+  /** Atomic amount in the token's decimals. */
+  amount: string;
+  asset: string;
+  chain: string;
+  tx_hash: string | null;
+  payer: string;
+  resolved_by: 'reconciler';
+  [key: string]: unknown;
+}
+
+/** `data` type for each event name. */
+export interface WebhookEventDataMap {
+  'checkout.session.created': CheckoutSessionCreatedData;
+  'checkout.session.deposit_detected': CheckoutSessionDepositDetectedData;
+  'checkout.session.paid': CheckoutSessionPaidData;
+  'checkout.session.settled': CheckoutSessionSettledData;
+  'checkout.session.expired': CheckoutSessionExpiredData;
+  'checkout.session.unresolved': CheckoutSessionUnresolvedData;
+  'checkout.refund.recorded': CheckoutRefundRecordedData;
+  'x402.payment.resolved': X402PaymentResolvedData;
+}
+
+/**
+ * A webhook envelope typed per event — a discriminated union on `event`.
+ *
+ * @example
+ * ```ts
+ * const event = parseWebhookEvent(raw);
+ * if (event.event === 'checkout.session.paid') {
+ *   event.data.metadata.order_id; // your session metadata
+ *   event.data.late;              // boolean | undefined
+ * }
+ * ```
+ */
+export type WebhookEvent = {
+  [E in CheckoutWebhookEvent]: {
+    id: string;
+    event: E;
+    created_at: string;
+    data: WebhookEventDataMap[E];
+  };
+}[CheckoutWebhookEvent];
+
+/** Header names BitPal sends. */
 export const WEBHOOK_HEADERS = {
   signature: 'X-Webhook-Signature-256',
   timestamp: 'X-Webhook-Timestamp',
@@ -51,20 +170,18 @@ export const WEBHOOK_HEADERS = {
 const SIGNATURE_PREFIX = 'sha256=';
 
 /**
- * Webhook signature 검증.
+ * Verify a webhook signature.
  *
- * Contract:
- *  - Backend는 `X-Webhook-Signature-256: sha256=<hex>` 형식으로 보냄
- *  - 서명 대상은 raw HTTP body (envelope JSON string, byte 단위 동일)
- *  - HMAC-SHA256(body, secret) hex와 timing-safe compare
+ * BitPal sends `X-Webhook-Signature-256: sha256=<hex>`, where `<hex>` is
+ * `HMAC-SHA256(secret, "<X-Webhook-Timestamp>.<raw body>")`. Pass the raw request body exactly as received
+ * (parsing and re-serialising it breaks the signature) and the `X-Webhook-Timestamp` header. The timestamp must be
+ * within `toleranceSec` (default 300 s) of now, which blocks replays. The comparison is timing-safe.
  *
- * 본 함수는 두 형식 모두 허용하지 않고 canonical(`sha256=<hex>`)만 처리한다.
- * raw hex만 받는 형식은 폐기됨 (backend 단일 contract).
- *
- * @param payload - HTTP request raw body (string)
- * @param signature - `X-Webhook-Signature-256` 헤더 값 (`sha256=<hex>`)
- * @param secret - webhook 등록 시 1회 노출된 raw secret (`whsec_...`)
- * @returns true if signature matches
+ * @param payload - Raw HTTP request body (string).
+ * @param signature - `X-Webhook-Signature-256` header value (`sha256=<hex>`).
+ * @param secret - The endpoint's signing secret (`whsec_…`), shown once when the endpoint was created.
+ * @param opts - `timestamp` (required): the `X-Webhook-Timestamp` header value.
+ * @returns `true` if the signature matches and the timestamp is fresh. Async — always `await` it.
  *
  * @example
  * ```ts
@@ -72,16 +189,16 @@ const SIGNATURE_PREFIX = 'sha256=';
  * import { verifyWebhookSignature, parseWebhookEvent, WEBHOOK_HEADERS } from '@bitpal/checkout';
  *
  * app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
- *   const raw = req.body.toString('utf8'); // raw body — parse/re-serialize 하면 서명 깨짐
+ *   const raw = req.body.toString('utf8'); // raw body — do not parse and re-serialise
  *   const ok = await verifyWebhookSignature(
  *     raw,
  *     req.header(WEBHOOK_HEADERS.signature) ?? '',
  *     process.env.BITPAL_WEBHOOK_SECRET!,
- *     { timestamp: req.header(WEBHOOK_HEADERS.timestamp) ?? '' }, // replay 방어 — 필수
+ *     { timestamp: req.header(WEBHOOK_HEADERS.timestamp) ?? '' },
  *   );
  *   if (!ok) return res.status(400).send('invalid signature');
  *   const event = parseWebhookEvent(raw);
- *   // dedup 은 서명된 body 의 event.id 로 (헤더 X-Webhook-Id 는 미서명)
+ *   // deduplicate on the signed body id (the X-Webhook-Id header is not signed)
  *   if (await alreadyProcessed(event.id)) return res.status(200).send('dup');
  *   if (event.event === 'checkout.session.paid') { ... }
  *   res.status(200).send('ok');
@@ -89,9 +206,9 @@ const SIGNATURE_PREFIX = 'sha256=';
  * ```
  */
 export interface VerifyWebhookOptions {
-  /** `X-Webhook-Timestamp` 헤더 값(ISO UTC). 서명 대상에 포함되며 freshness 검사에 쓰인다. 필수. */
+  /** `X-Webhook-Timestamp` header value (ISO 8601 UTC). Part of the signed string and checked for freshness. Required. */
   timestamp: string;
-  /** freshness 허용 오차(초). 기본 300(5분). |now - timestamp| 초과 시 replay 로 간주해 거부. */
+  /** Allowed clock difference in seconds (default 300). Timestamps further away are rejected as replays. */
   toleranceSec?: number;
 }
 
@@ -104,11 +221,11 @@ export async function verifyWebhookSignature(
   if (!payload || !signature || !secret) return false;
   if (!signature.startsWith(SIGNATURE_PREFIX)) return false;
 
-  // replay 방어: X-Webhook-Timestamp 없이는 검증 불가(v0.4 breaking — body-only 폐기).
+  // Replay protection: the timestamp is required.
   const timestamp = opts?.timestamp;
   if (!timestamp) return false;
 
-  // 유효 timestamp 만 — Date.parse 실패(NaN)를 명시 거부하고, canonical ISO UTC 만 허용.
+  // Only a valid, canonical ISO UTC timestamp.
   const parsedMs = Date.parse(timestamp);
   if (!Number.isFinite(parsedMs)) return false;
   if (new Date(parsedMs).toISOString() !== timestamp) return false;
@@ -122,7 +239,7 @@ export async function verifyWebhookSignature(
     const crypto = await import('node:crypto');
     const expectedHex = crypto
       .createHmac('sha256', secret)
-      .update(`${timestamp}.${payload}`, 'utf8') // 서버와 동일: HMAC(`${timestamp}.${body}`)
+      .update(`${timestamp}.${payload}`, 'utf8') // same as the server: HMAC(secret, `${timestamp}.${body}`)
       .digest('hex');
 
     if (sigHex.length !== expectedHex.length) return false;
@@ -137,12 +254,12 @@ export async function verifyWebhookSignature(
 }
 
 /**
- * Webhook envelope 파싱.
- * 형식 검증 후 `WebhookPayload` 타입으로 캐스팅.
+ * Parse a webhook body into a {@link WebhookEvent} (narrow on `event` to get typed `data`).
+ * Verify the signature first. The result is also assignable to {@link WebhookPayload}.
  *
- * @throws Error 형식이 envelope이 아닐 때
+ * @throws Error when the body is not a webhook envelope.
  */
-export function parseWebhookEvent(body: string): WebhookPayload {
+export function parseWebhookEvent(body: string): WebhookEvent {
   const parsed = JSON.parse(body) as Record<string, unknown>;
   if (
     typeof parsed.id !== 'string' ||
@@ -153,5 +270,5 @@ export function parseWebhookEvent(body: string): WebhookPayload {
   ) {
     throw new Error('Invalid webhook envelope — expected {id, event, created_at, data}');
   }
-  return parsed as unknown as WebhookPayload;
+  return parsed as unknown as WebhookEvent;
 }

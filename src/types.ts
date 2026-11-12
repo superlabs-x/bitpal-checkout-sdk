@@ -1,68 +1,66 @@
 /**
- * @bitpal/checkout SDK — 타입 정의
+ * @bitpal/checkout SDK — type definitions
  */
 
 export interface BitPalConfig {
   /**
-   * API 키(서버 전용, secret). prefix 가 mode 를 결정합니다:
-   *   - `bp_test_...` → TEST mode (testnet 또는 local anvil)
-   *   - `bp_live_...` → LIVE mode (mainnet)
+   * API key (server-side only, secret). The prefix selects the mode:
+   *   - `bp_test_...` → TEST mode (testnets)
+   *   - `bp_live_...` → LIVE mode (mainnets)
    *
-   * BitPal 콘솔 → Developers → API Keys 에서 발급.
+   * Create one in the BitPal console → Developers → API Keys.
    *
-   * **선택**: createSession/listSessions/products 등 서버 메서드는 필수. buyer-facing 공개 메서드
-   * (getPublicSession/getStatus/issueDepositAddress)는 apiKey 가 필요 없다(issueDepositAddress 는 session_token 필요).
-   * 단 **브라우저(CORS)** 에서 임의 머천트 도메인이 직접 부를 수 있는 것은 `getPublicSession` 뿐이다 —
-   * `issueDepositAddress`/`getStatus` 는 머천트 백엔드를 경유해 호출한다(자체 결제 UI = 헤드리스 checkout).
-   * 절대 secret 키를 브라우저에 노출하지 말 것.
+   * **Optional**: required for server methods such as createSession/listSessions/products. The buyer-facing public
+   * methods (getPublicSession/getStatus/issueDepositAddress) do not need an apiKey (issueDepositAddress needs a session_token).
+   * However, only `getPublicSession` can be called directly from a **browser (CORS)** on an arbitrary merchant domain —
+   * call `issueDepositAddress`/`getStatus` through your backend (custom payment UI = headless checkout).
+   * Never expose your secret key in the browser.
    */
   apiKey?: string;
   /**
-   * BitPal API 기본 URL. 환경별로 다릅니다:
-   *   - production: `https://api.bitpal.io` (기본값) — 실제 testnet/mainnet 컨트랙트
-   *   - local dev:  `http://localhost:3100`  — anvil 로컬 체인 + 로컬 BitPal API
+   * BitPal API base URL. Defaults to `https://api.bitpal.io`.
    *
-   * mode (TEST/LIVE) 와 baseUrl 은 직교 (orthogonal): 어떤 baseUrl 이든 키 prefix 가 mode 를 결정.
+   * TEST vs LIVE is chosen by the API key prefix (`bp_test_` / `bp_live_`), not by the URL.
    */
   baseUrl?: string;
-  /** 요청 타임아웃 (ms, 기본값: 30000) */
+  /** Request timeout in ms (default: 30000) */
   timeout?: number;
 }
 
-/** 응답/정규화된 line item — amount 는 항상 canonical 6dp atomic 정수(실제 결제 토큰 decimals 아님). */
+/** Normalized line item as returned — amount is always a canonical 6dp atomic integer (not the pay token's decimals). */
 export interface LineItem {
   name: string;
-  /** canonical 6dp atomic 정수 문자열("1"="1000000", "29"="29000000"). */
+  /** Canonical 6dp atomic integer string ("1"="1000000", "29"="29000000"). */
   amount: string;
   currency: string;
   quantity?: number;
 }
 
 /**
- * 세션 생성 입력용 line item. 금액은 둘 중 **하나**:
- *   - `amount`(권장): 사람 표기 canonical 6dp 문자열(예 "29", "0.5", "29.00"). decimal 신경 쓸 필요 없음.
- *     ※ `currency`(예: 'USDC'/'USDT'/'JPYC')가 실제 결제 통화를 결정한다 — `amount`는 그 통화의 canonical
- *     6dp 표기일 뿐 항상 USD 를 뜻하지 않는다(예: currency='JPYC' + amount="29" → 29 JPYC/29엔, 환율
- *     변환 없음). 실제 결제 토큰 decimals(USDC 6dp / JPYC 18dp 등)로의 재스케일은 발급 시 서버가 처리.
- *   - `amount_atomic`: 이미 raw canonical 6dp 정수 문자열($1="1000000")인 경우(고급/기존 코드).
- * 둘 다 지정하거나 둘 다 생략하면 SDK 가 에러를 throw 한다.
+ * Line item input for session creation. Provide **exactly one** amount field:
+ *   - `amount` (recommended): human-readable canonical 6dp string (e.g. "29", "0.5", "29.00"). No decimals handling needed.
+ *     Note: `currency` (e.g. 'USDC'/'USDT'/'JPYC') determines the actual payment currency — `amount` is just the canonical
+ *     6dp notation in that currency and does not always mean USD (e.g. currency='JPYC' + amount="29" → 29 JPYC/29 yen,
+ *     no FX conversion). Rescaling to the actual pay token's decimals (USDC 6dp / JPYC 18dp, etc.) is done by the server.
+ *   - `amount_atomic`: when you already have a raw canonical 6dp integer string ($1="1000000") (advanced/legacy code).
+ * The SDK throws if both or neither are given.
  */
 export interface LineItemInput {
   name: string;
   currency: string;
   quantity?: number;
-  /** 사람 표기 canonical 6dp 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  /** Human-readable canonical 6dp amount (e.g. "29", "0.5") — recommended. Mutually exclusive with amount_atomic. */
   amount?: string;
-  /** raw canonical 6dp 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  /** Raw canonical 6dp integer ($1="1000000") — advanced/legacy. Mutually exclusive with amount. */
   amount_atomic?: string;
 }
 
-// PROD-LINK-3b: SDK Catalog Checkout — BitPal에 저장된 price_id 참조 line item.
-// 금액/통화는 보내지 않는다 — 서버가 Price를 resolve해 세션 snapshot으로 고정한다
-// (Price ID가 금액 source of truth). v1은 raw와 price_id를 한 세션에 혼합할 수 없다
-// (서버가 MIXED_LINE_ITEMS로 거부).
+// Catalog checkout: a line item referencing a price_id stored in BitPal.
+// Do not send amount/currency — the server resolves the Price and freezes it into the session snapshot
+// (the Price is the source of truth for the amount). Raw line items and price_id items cannot be mixed
+// in one session (the server rejects with MIXED_LINE_ITEMS).
 export interface PriceLineItem {
-  /** price_... — bitpal.checkout.prices.create()로 만든 가격 */
+  /** price_... — a price created with bitpal.checkout.prices.create() */
   price_id: string;
   quantity?: number;
 }
@@ -70,49 +68,68 @@ export interface PriceLineItem {
 export type CheckoutLineItemInput = LineItemInput | PriceLineItem;
 
 export interface CreateSessionParams {
+  /**
+   * Line items. The total (sum of `amount × quantity`) must be at least 1.00 in the session currency
+   * (USDC/USDT: $1, JPYC: ¥1), otherwise the API returns `400 CHECKOUT_AMOUNT_TOO_LOW`. Some networks need more
+   * (Tron: $300, JPYC: ¥100 on every network) and are not offered for smaller totals.
+   */
   line_items: CheckoutLineItemInput[];
-  /** @deprecated 서버가 사용하지 않는다(무시됨). 입금자 주소는 결제 시 온체인에서 기록된다. */
+  /** @deprecated Ignored by the server. The payer address is recorded on-chain at payment time. */
   payer_wallet?: string;
-  /** 결제 체인 (예: eip155:8453). 단일 고정 — allowed_pay_chains와 상호 배타. */
+  /** Payment chain (e.g. eip155:8453). Single fixed chain — mutually exclusive with allowed_pay_chains. */
   pay_chain?: string;
   /**
-   * 허용 결제 체인 목록 (CAIP-2). 구매자가 이 중에서 선택하며, 하나뿐이면 자동 선택된다.
-   * pay_chain(단일 고정)과 **상호 배타** — 동시 지정 시 SDK가 에러를 throw한다.
-   * 예: ['eip155:84532', 'eip155:11155420', 'eip155:80002', 'eip155:421614']
+   * Allowed payment chains (CAIP-2). The buyer picks one; if there is only one it is selected automatically.
+   * **Mutually exclusive** with pay_chain (single fixed chain) — the SDK throws if both are given.
+   * Example: ['eip155:84532', 'eip155:11155420', 'eip155:80002', 'eip155:421614']
    */
   allowed_pay_chains?: string[];
   /**
-   * chain×token cell 허용 목록(**결제 수단** 표준 입력) — buyer 가 (체인, 토큰) 조합을 고른다.
-   * allowed_pay_chains(×단일 currency shorthand)보다 우선. 서로 다른 토큰을 섞을 때 사용.
-   * `chain` 은 short-name('base','tron','solana') 또는 CAIP-2 둘 다 허용(서버가 mode-relative 로 정규화).
-   * paymentLinks.allowed_assets 와 동일 형태(SDK 일관).
-   * 예: [{ chain: 'base', token: 'USDC' }, { chain: 'tron', token: 'USDT' }]
+   * Allowed chain×token cells (the standard input for **payment methods**) — the buyer picks a (chain, token) pair.
+   * Takes precedence over allowed_pay_chains (× single currency shorthand). Use it to mix different tokens.
+   * `chain` accepts a short name ('base', 'tron', 'solana') or CAIP-2 (the server normalizes it for the current mode).
+   * Same shape as paymentLinks.allowed_assets.
+   * Example: [{ chain: 'base', token: 'USDC' }, { chain: 'tron', token: 'USDT' }]
    */
   allowed_assets?: Array<{ chain: string; token: string }>;
-  /** @deprecated 서버가 사용하지 않는다(무시됨). 결제 자산은 `allowed_assets` 로 지정한다. */
+  /** @deprecated Ignored by the server. Specify payment assets with `allowed_assets`. */
   pay_asset?: string;
   /**
-   * @deprecated 부족 결제는 수용하지 않는다 — "0" 만 허용, 그 외 값은 400.
-   *   부족하게 들어오면 `unresolved_underpaid` 가 되고 같은 주소로 나머지를 보내면 완료된다.
+   * @deprecated Underpayments are not accepted — only "0" is allowed; any other value returns 400.
+   *   An underpaid session becomes `unresolved_underpaid`; sending the remainder to the same address completes it.
    */
   tolerance_percent?: string;
   /**
-   * 결제 대기 시간(분). 1~60, 기본 15. 이 시간이 지나면 세션이 만료된다
-   * (만료 후 도착한 정확 금액은 7일 안이면 늦은 결제로 인정 — `late: true`).
+   * Payment window in minutes. 1–60, default 15. The session expires after this
+   * (an exact payment arriving after expiry is accepted as a late payment within 7 days — `late: true`).
    */
   expires_in_minutes?: number;
   /**
-   * @deprecated `expires_in_minutes` 를 쓴다. 60~3600 초만 허용되고 분 단위로 올림해 보낸다.
-   * (0.11 까지는 서버가 이 필드를 몰라 무시했고, 항상 기본 15분이 적용됐다.)
+   * @deprecated Use `expires_in_minutes`. Only 60–3600 seconds are accepted; the value is rounded up to minutes.
+   * (Up to 0.11 the server ignored this field and the default 15 minutes always applied.)
    */
   expires_in_seconds?: number;
-  /** 메타데이터 (모든 값은 string 이어야 함) */
+  /**
+   * Your data (e.g. `{ order_id: '1042' }`). Returned on the session and included in every webhook's `data.metadata`.
+   * Reserved keys BitPal writes itself (`_bitpal`, `payer_email`, `allowed_pay_chains`, `allowed_assets`) are dropped
+   * from webhooks — don't use them.
+   */
   metadata?: Record<string, string>;
-  /** 결제 완료 후 buyer 가 redirect 될 URL (선택) */
+  /** URL the buyer is redirected to after payment (optional) */
   success_url?: string;
-  /** 결제 취소 시 buyer 가 redirect 될 URL (선택) */
+  /** URL the buyer is redirected to on cancel (optional) */
   cancel_url?: string;
+  /**
+   * What happens to a full payment that arrives after the payment deadline.
+   * - `'accept'` (default): accepted as a late payment for up to 7 days (`checkout.session.paid` with `late: true`).
+   * - `'refund'`: never accepted — refunded automatically to the buyer's refund address about 7 days after the
+   *   deadline (refund kind `late_deposit`). The non-custodial deposit contract does not allow an earlier refund.
+   */
+  late_payments?: CheckoutLatePayments;
 }
+
+/** Session option for full payments that arrive after the deadline. See `CreateSessionParams.late_payments`. */
+export type CheckoutLatePayments = 'accept' | 'refund';
 
 export interface CheckoutSession {
   id: string;
@@ -128,69 +145,79 @@ export interface CheckoutSession {
   expires_at: string | null;
   paid_at: string | null;
   settled_at: string | null;
+  /**
+   * @deprecated Kept for compatibility; returns the same value as `deposit_tx_hash`.
+   * Use `deposit_tx_hash` (buyer payment) and `sweep_tx_hash` (settlement to your wallet).
+   */
   tx_hash: string | null;
   created_at: string;
-  /** 'TEST' | 'LIVE' — 조회(getSession/listSessions) 응답에 있다. */
+  /** 'TEST' | 'LIVE' — present in retrieval responses (getSession/listSessions). */
   mode?: 'TEST' | 'LIVE';
-  /** 지금까지 입금주소로 들어온 금액 — 결제 토큰 atomic(`token_decimals` 기준). */
+  /** Amount received at the deposit address so far — pay-token atomic units (per `token_decimals`). */
   amount_received?: string | null;
-  /** 결제 토큰 decimals(USDC/USDT=6, BSC-USD=18). amount_total 은 항상 6dp. */
+  /** Pay token decimals (USDC/USDT=6, BSC-USD=18). amount_total is always 6dp. */
   token_decimals?: number | null;
   payment_method?: string | null;
   deposit_address?: string | null;
   refund_address?: string | null;
-  /** 입금주소로 실제 들어온 토큰 컨트랙트/mint. */
+  /** Late-payment option the session was created with (`'accept'` when not set). */
+  late_payments?: CheckoutLatePayments;
+  /** Address of the token contract/mint actually received at the deposit address (not the symbol). Tron: base58 `T…`. */
   received_token?: string | null;
+  /** Symbol of `received_token` (e.g. `USDC`). null if nothing was received yet or the token is unknown (e.g. a wrong token). */
+  received_token_symbol?: string | null;
+  /** The buyer's payment into the deposit address. */
   deposit_tx_hash?: string | null;
+  /** The settlement to your payout wallet (or the refund/rescue for a refunded session). */
   sweep_tx_hash?: string | null;
   fee_amount?: string | null;
   fee_rate?: string | null;
   net_amount?: string | null;
-  /** 수수료·정산액을 결제 토큰 자릿수(token_decimals) 그대로 — 온체인 금액과 정확히 같다. 발급 전 null. */
+  /** Fee and net amount in the pay token's own decimals (token_decimals) — exactly matches the on-chain amounts. null before a deposit address is issued. */
   fee_amount_token?: string | null;
   net_amount_token?: string | null;
   success_url?: string | null;
   cancel_url?: string | null;
   metadata?: Record<string, unknown> | null;
   payment_link_id?: string | null;
-  /** 'hosted' — 결제 경로. 안2 는 hosted deposit-address 단일 경로. */
+  /** 'hosted' — the payment path (hosted deposit address). */
   payment_source?: string;
-  /** 호스티드 결제 페이지 URL (token 쿼리 포함). backend 응답 그대로 사용 — buyer를 이 URL로 redirect. */
+  /** Hosted payment page URL (includes the token query). Use as returned — redirect the buyer here. */
   checkout_url?: string;
-  /** 1회용 session token. `checkout_url`에 이미 query로 박혀 있어 별도 사용 불필요. */
+  /** One-time session token. Already embedded in `checkout_url`, so no separate use is needed. */
   session_token?: string;
-  /** `checkout_url`의 별칭 (backwards compat). buyer redirect 시 이 필드 또는 `checkout_url` 사용. */
+  /** Alias of `checkout_url` (backwards compat). Redirect the buyer using this or `checkout_url`. */
   url: string;
 }
 
 /**
- * 안2 결제 옵션(chain×token). `/public` 이 서버 권위로 내려주며, buyer 가 하나를 골라
- * `issueDepositAddress({ chain, token })` 로 입금주소를 발급받는다. 단일-자산 세션은 1개.
+ * Payment option (chain×token). Provided authoritatively by `/public`; the buyer picks one and
+ * calls `issueDepositAddress({ chain, token })` to get a deposit address. Single-asset sessions have exactly one.
  */
 export interface PaymentOption {
-  /** CAIP-2 (예: eip155:8453, tron:0x2b6653dc, solana:5eykt4…). 체인 식별의 canonical. */
+  /** CAIP-2 (e.g. eip155:8453, tron:0x2b6653dc, solana:5eykt4…). Canonical chain identifier. */
   caip2: string;
-  /** EVM numeric chainId. 비-EVM(Tron/Solana)은 null — 식별은 caip2 사용. */
+  /** EVM numeric chainId. null for non-EVM (Tron/Solana) — use caip2 to identify. */
   chain_id: number | null;
   token_symbol: string;
-  /** 토큰 컨트랙트/mint 주소(EVM 0x / Tron base58 / Solana base58 mint). */
+  /** Token contract/mint address (EVM 0x / Tron base58 / Solana base58 mint). */
   token_address: string;
-  /** 토큰 decimals(USDC/USDT=6, BSC-USD=18). atomic↔decimal 변환에 필수 — 6dp 가정 금지. */
+  /** Token decimals (USDC/USDT=6, BSC-USD=18). Required for atomic↔decimal conversion — do not assume 6dp. */
   decimals: number;
-  /** 이 토큰으로 보낼 정확 금액(atomic, 이 토큰의 decimals 기준). */
+  /** Exact amount to send in this token (atomic, in this token's decimals). */
   amount_atomic?: string;
   /**
-   * false = 목록에는 보이지만 아직 선택할 수 없는 옵션(`unavailable_reason` 참고). 이 옵션으로 `issueDepositAddress` 를
-   * 호출하면 409 `CHECKOUT_CHAIN_COMING_SOON`. 0.13.0 에서 추가 — 이전 API 응답에는 없을 수 있어 optional.
+   * false = shown in the list but not selectable yet (see `unavailable_reason`). Calling `issueDepositAddress` with
+   * this option returns 409 `CHECKOUT_CHAIN_COMING_SOON`. Added in 0.13.0 — optional because older API responses may omit it.
    */
   available?: boolean;
-  /** 선택할 수 없는 이유. `coming_soon` = 이 네트워크는 곧 결제가 열린다. 선택 가능하면 null. */
+  /** Why the option is not selectable. `coming_soon` = payments on this network open soon. null when selectable. */
   unavailable_reason?: 'coming_soon' | null;
 }
 
 /**
- * `getPublicSession()` (`GET /v1/checkout/sessions/:id/public`) 응답 — 인증 불요(공개).
- * buyer-facing 결제 페이지가 표시/폴링에 쓰는 서버 권위 뷰.
+ * `getPublicSession()` (`GET /v1/checkout/sessions/:id/public`) response — public, no authentication.
+ * Server-authoritative view used by buyer-facing payment pages for display/polling.
  */
 export interface PublicSession {
   id: string;
@@ -199,36 +226,38 @@ export interface PublicSession {
   mode: string | null;
   currency: string;
   /**
-   * 주문 총액 — **canonical μUSD(6dp) 정수 문자열**(가격 통화 기준, $1 = "1000000"). 결제 토큰 decimals 와 무관하다
-   * (18dp 토큰으로 결제해도 6dp). 온체인으로 보낼 토큰 단위 금액은 `pay_amount`(또는 발급 응답 `expectedAmount`).
+   * Order total — **canonical μUSD (6dp) integer string** (in the price currency, $1 = "1000000"), independent of the
+   * pay token's decimals (still 6dp when paying with an 18dp token). The token amount to send on-chain is `pay_amount`
+   * (or `expectedAmount` in the issue response).
    */
   amount_total: string;
-  /** 지금까지 입금주소에 들어온 금액 — **결제 토큰 atomic**(`token_decimals` 기준). 미입금이면 null. */
+  /** Amount received at the deposit address so far — **pay-token atomic** (per `token_decimals`). null if nothing received. */
   amount_received?: string | null;
   /**
-   * 선택된 결제 토큰 단위의 총액(atomic, `token_decimals` 기준) — 구매자가 송금할 정확 금액. 자산 미선택이면 null.
-   * = canonicalToTokenAtomic(amount_total, token_decimals). 부족액 = pay_amount − amount_received.
+   * Total in the selected pay token (atomic, per `token_decimals`) — the exact amount the buyer must send. null if no asset selected.
+   * = canonicalToTokenAtomic(amount_total, token_decimals). Remaining = pay_amount − amount_received.
    */
   pay_amount?: string | null;
   pay_chain: string | null;
   pay_asset: string | null;
-  /** 발급된 주문별 forwarder 입금주소(미발급이면 null). */
+  /** Issued per-order forwarder deposit address (null if not issued). */
   deposit_address?: string | null;
   /**
-   * Solana 전용: 구매자가 받는 사람으로 넣을 지갑(owner) 주소 — 입금 토큰 계정(deposit_address)을 소유한 주문 계정.
-   * 지갑은 이 주소에서 토큰 계정을 도출하므로 이것을 수신자로 쓴다. EVM/Tron 은 null.
+   * Solana only: the wallet (owner) address the buyer should use as recipient — the order account that owns the
+   * deposit token account (deposit_address). Wallets derive the token account from this address. null for EVM/Tron.
    */
   deposit_owner?: string | null;
   /**
-   * 입금주소 발급 후: 그 주소로 보낸 송금을 정상 처리하는 마감(ISO, expires_at + grace ~90분). 미발급이면 null.
-   * expires_at 이 지나면 새 송금을 받지 말고(주소 비노출) 이 시각까지 확인을 기다린다.
+   * After a deposit address is issued: deadline (ISO, expires_at + ~90 min grace) until which transfers to that address
+   * are processed normally. null if not issued. After expires_at, stop accepting new transfers (hide the address) and
+   * wait for confirmation until this time.
    */
   payment_deadline_at?: string | null;
-  /** 구매자 선택 가능한 결제 옵션(서버 권위). 단일-자산이면 1개. */
+  /** Payment options the buyer can choose (server-authoritative). Exactly one for single-asset sessions. */
   payment_options: PaymentOption[];
   chain_id: number | null;
   token_address: string | null;
-  /** 선택된 pay 토큰 decimals(발급 후). amount_received / pay_amount 해석에 사용 — 6dp 가정 금지(amount_total 은 항상 6dp). */
+  /** Selected pay token decimals (after issue). Use to interpret amount_received / pay_amount — do not assume 6dp (amount_total is always 6dp). */
   token_decimals?: number | null;
   tx_hash: string | null;
   release_tx_hash?: string | null;
@@ -245,47 +274,47 @@ export interface PublicSession {
 }
 
 /**
- * `issueDepositAddress()` 요청 파라미터.
- * chain/token 은 멀티옵션 세션에서만 필요(단일-자산 세션은 생략). refundAddress 는 필수 —
- * 금액부족/잘못된토큰/만료 시 이 주소로 환불되며, 입금주소에 커밋되어 발급 후 변경 불가.
+ * `issueDepositAddress()` request parameters.
+ * chain/token are only needed for multi-option sessions (omit for single-asset sessions). refundAddress is required —
+ * underpayments, wrong tokens and expired payments are refunded to it; it is committed into the deposit address and cannot be changed after issue.
  */
 export interface IssueDepositAddressParams {
-  /** 결제 페이지 접근 증명(HMAC). createSession 응답의 session_token. */
+  /** Proof of payment-page access (HMAC). The session_token from the createSession response. */
   session_token: string;
   /**
-   * 환불 주소. 필수. 선택한 체인의 VM 형식이어야 한다:
-   *   EVM=0x…, Tron=base58(T…), Solana=base58. 결제와 같은 네트워크의 본인 주소.
-   * 금액부족/잘못된토큰/만료 시 이 주소로 환불되며, 입금주소에 커밋되어 발급 후 변경 불가.
+   * Refund address. Required. Must match the selected chain's VM format:
+   *   EVM=0x…, Tron=base58 (T…), Solana=base58. The buyer's own address on the same network as the payment.
+   * Underpayments, wrong tokens and expired payments are refunded to it; it is committed into the deposit address and cannot be changed after issue.
    */
   refundAddress: string;
-  /** 선택 자산의 chain(CAIP-2 또는 short-name). 멀티옵션 세션 필수. */
+  /** Chain of the selected asset (CAIP-2 or short name). Required for multi-option sessions. */
   chain?: string;
-  /** 선택 자산의 token symbol(예: USDC). 멀티옵션 세션 필수. */
+  /** Token symbol of the selected asset (e.g. USDC). Required for multi-option sessions. */
   token?: string;
 }
 
 /**
- * `issueDepositAddress()` 응답 — 이 주소로 정확 금액을 송금하면 watcher 가 감지, keeper 가 정산한다.
+ * `issueDepositAddress()` response — send the exact amount to this address; BitPal detects and settles it.
  */
 export interface DepositAddress {
   sessionId: string;
   chain: string;
-  /** 주문별 결정적 입금주소(EVM/Tron=CREATE2 forwarder, Solana=order PDA 의 deposit ATA). */
+  /** Deterministic per-order deposit address (EVM/Tron = CREATE2 forwarder, Solana = deposit ATA of the order PDA). */
   depositAddress: string;
   expectedToken: string;
-  /** Atomic 정수 문자열. */
+  /** Atomic integer string. */
   expectedAmount: string;
   feeAmount: string;
   refundAddress: string;
   /** Unix seconds — on-chain deadline. */
   deadline: string;
   expiresAt: string | null;
-  /** Solana 전용: 수신자로 넣을 지갑(owner) 주소(`PublicSession.deposit_owner` 와 같음). EVM/Tron 은 null. */
+  /** Solana only: wallet (owner) address to use as recipient (same as `PublicSession.deposit_owner`). null for EVM/Tron. */
   depositOwner?: string | null;
 }
 
 /**
- * `getStatus()` (`GET /v1/checkout/sessions/:id/status`) 응답 — 경량 폴링용(API 키, 자기 세션만).
+ * `getStatus()` (`GET /v1/checkout/sessions/:id/status`) response — lightweight polling (API key, own sessions only).
  */
 export interface SessionStatus {
   status: string;
@@ -293,9 +322,9 @@ export interface SessionStatus {
 }
 
 /**
- * 수수료 미리보기 응답.
- * amount, fee_amount, net_amount는 모두 atomic μUSDC 문자열 (e.g. "1500000" = $1.50).
- * fee_rate는 비율 문자열 (e.g. "0.015" = 1.5%).
+ * Fee preview response.
+ * amount, fee_amount and net_amount are atomic μUSDC strings (e.g. "1500000" = $1.50).
+ * fee_rate is a ratio string (e.g. "0.015" = 1.5%).
  */
 export interface FeePreview {
   amount: string;
@@ -305,13 +334,40 @@ export interface FeePreview {
 }
 
 /**
- * 환불은 온체인 자동 경로 — SDK 에 수동 환불 API 는 없다.
- * 금액부족/잘못된토큰/만료 시 issueDepositAddress 에 지정한 refundAddress 로 자동 환불되고,
- * 세션 status(expired/unresolved) + webhook 으로 통지된다.
+ * Refunds — there is **no refund method in this SDK, by design.** BitPal is non-custodial: payments settle straight
+ * to your payout wallet and BitPal cannot pull them back.
+ * - Mismatched payments (underpaid, overpaid excess, wrong token, late deposit) are refunded automatically on-chain
+ *   to the buyer's `refundAddress`.
+ * - A completed payment is refunded by you in the BitPal console (Sessions → session → Refund): send from your own
+ *   wallet and record the transaction there. Recording is console-only (an API key gets `403 REFUND_CONSOLE_ONLY`).
+ * Every refund fires the `checkout.refund.recorded` webhook with a {@link CheckoutRefundRecord} as `data`.
  */
 
 /**
- * 멱등성 키 — 동일 키로 재시도 시 backend가 같은 결과 반환.
+ * Refund kinds. Automatic: `overpay_excess`, `underpay_expired`, `wrong_token`, `late_deposit`.
+ * `merchant`: you refunded a completed payment from your own wallet and recorded it in the console.
+ * New kinds may be added — treat unknown values as a generic refund.
+ */
+export type CheckoutRefundKind = 'overpay_excess' | 'underpay_expired' | 'wrong_token' | 'late_deposit' | 'merchant';
+
+/** `data` of the `checkout.refund.recorded` webhook (and an item of `GET /v1/checkout/sessions/{id}/refunds`). */
+export interface CheckoutRefundRecord {
+  session_id?: string;
+  kind: CheckoutRefundKind | (string & {});
+  /** Atomic integer string in the token's own decimals. */
+  amount: string;
+  /** Token contract / mint address. */
+  token: string;
+  tx_hash: string;
+  refund_address: string;
+  /** `merchant` only: the wallet the refund was sent from. */
+  from_address?: string | null;
+  /** `merchant` only: `customer_request` | `duplicate` | `product_issue` | `other`. */
+  reason_code?: string | null;
+}
+
+/**
+ * Idempotency key — retrying with the same key returns the same result.
  */
 export interface IdempotencyOptions {
   idempotencyKey?: string;
@@ -322,7 +378,7 @@ export interface ApiResponse<T> {
   error?: string;
 }
 
-/** 목록 응답 meta — total 은 필터 조건에 맞는 전체 개수(페이지 무관). */
+/** List response meta — total is the number of all records matching the filter (independent of paging). */
 export interface ListMeta {
   total?: number;
   limit?: number;
@@ -336,10 +392,10 @@ export interface ListResponse<T> {
   meta?: ListMeta;
 }
 
-// ── Product / immutable Price 관리 (server-side) ──
-// Price는 immutable — amount_atomic/currency/token_symbol/billing_type/product_id는
-// 생성 후 변경 불가 (update params에 존재하지 않음). token_address는 Price에 없다
-// (chain-agnostic, K-11 — chain별 token address는 세션 생성 시 registry가 결정).
+// ── Product / immutable Price management (server-side) ──
+// Prices are immutable — amount_atomic/currency/token_symbol/billing_type/product_id cannot be
+// changed after creation (they are not in the update params). A Price has no token_address
+// (chain-agnostic — the per-chain token address is resolved when a session is created).
 
 export interface CheckoutProduct {
   /** prod_... */
@@ -360,7 +416,7 @@ export interface CheckoutPrice {
   id: string;
   /** prod_... */
   product_id: string;
-  /** 원자 단위 정수 문자열 ($1 = "1000000") — 불변 */
+  /** Atomic integer string ($1 = "1000000") — immutable */
   amount_atomic: string;
   currency: string;
   token_symbol: string;
@@ -388,24 +444,23 @@ export interface UpdateProductParams {
 }
 
 /**
- * 가격 생성 입력. 금액은 둘 중 **하나** (line item 과 동일 모델):
- *   - `amount`(권장): 사람 표기 canonical 6dp 문자열(예 "29", "0.5"). decimal 신경 쓸 필요 없음.
- *   - `amount_atomic`: raw canonical 6dp 정수($1="1000000") — 고급/기존.
- * 둘 다 지정하거나 둘 다 생략하면 서버가 400 을 반환한다.
+ * Price creation input. Provide **exactly one** amount field (same model as line items):
+ *   - `amount` (recommended): human-readable canonical 6dp string (e.g. "29", "0.5"). No decimals handling needed.
+ *   - `amount_atomic`: raw canonical 6dp integer ($1="1000000") — advanced/legacy.
+ * The server returns 400 if both or neither are given.
  *
- * `amount`/`amount_atomic`은 실제 결제 토큰의 decimals 가 아니라 **항상 canonical 6dp**다 — 서버가
- * 결제 시점에 실제 토큰 decimals(예: JPYC=18dp)로 재스케일한다(1:1 가정, 환율 변환 없음). 즉
- * `token_symbol: 'JPYC'`로 "29"를 등록하면 29 JPYC(≈29엔)로 결제되지, 29 USD 상당의 JPYC로
- * 환산되지 않는다.
+ * `amount`/`amount_atomic` are **always canonical 6dp**, not the pay token's decimals — the server rescales to the
+ * actual token decimals (e.g. JPYC=18dp) at payment time (1:1, no FX conversion). So registering "29" with
+ * `token_symbol: 'JPYC'` charges 29 JPYC (≈29 yen), not the JPYC equivalent of 29 USD.
  *
- * `currency`는 입력받지 않는다 — 서버가 `token_symbol`에서 파생한다(불일치 방지).
+ * `currency` is not an input — the server derives it from `token_symbol` (to prevent mismatches).
  */
 export interface CreatePriceParams {
-  /** 사람 표기 canonical 6dp 금액(예 "29", "0.5") — 권장. amount_atomic 과 상호배타. */
+  /** Human-readable canonical 6dp amount (e.g. "29", "0.5") — recommended. Mutually exclusive with amount_atomic. */
   amount?: string;
-  /** raw canonical 6dp 정수($1="1000000") — 고급/기존. amount 와 상호배타. */
+  /** Raw canonical 6dp integer ($1="1000000") — advanced/legacy. Mutually exclusive with amount. */
   amount_atomic?: string;
-  /** 'USDC' | 'USDT' | 'JPYC' — 미지정 시 'USDC'. 이 Price 의 유일한 결제 자산(currency 는 여기서 파생). */
+  /** 'USDC' | 'USDT' | 'JPYC' — defaults to 'USDC'. The only payment asset of this Price (currency is derived from it). */
   token_symbol?: string;
   billing_type?: 'one_time';
   nickname?: string;
@@ -413,9 +468,9 @@ export interface CreatePriceParams {
 }
 
 /**
- * Price는 lifecycle 없는 immutable record — 변경 가능한 것은 nickname(표시 메타)뿐.
- * 금액류 필드(amount_atomic 등)는 immutable, "그만 팔기"는 Price 가 아니라 그 Price 를 쓰는
- * Payment Link 를 inactive 로 한다.
+ * A Price is an immutable record with no lifecycle — only nickname (display metadata) can be changed.
+ * Amount fields (amount_atomic etc.) are immutable. To stop selling, set the Payment Link that uses
+ * the Price to inactive rather than changing the Price.
  */
 export interface UpdatePriceParams {
   nickname?: string | null;
@@ -432,25 +487,25 @@ export interface ListPricesParams {
   offset?: number;
 }
 
-// ── Payment Link 관리 (server-side) ──
-// 대시보드 UI 없이 코드로 결제 링크를 만드는 경로. 흐름: product → price → payment link.
-// link ↔ price binding 은 생성 후 고정(immutable) — 다른 가격은 새 링크로. share_token 은
-// 서버가 자동 생성하며 호스티드 결제 URL 은 `{checkoutBase}/plink/{share_token}` 형태.
+// ── Payment Link management (server-side) ──
+// Create payment links in code without the dashboard. Flow: product → price → payment link.
+// The link ↔ price binding is fixed after creation — use a new link for a different price. share_token is
+// generated by the server; the hosted payment URL is `{checkoutBase}/plink/{share_token}`.
 
 export interface CheckoutPaymentLink {
   /** plink_... */
   id: string;
-  /** 고엔트로피 공개 토큰 — 호스티드 URL `{checkoutBase}/plink/{share_token}` 에 사용 */
+  /** High-entropy public token — used in the hosted URL `{checkoutBase}/plink/{share_token}` */
   share_token: string;
-  /** price_... — 이 링크가 파는 가격(생성 후 고정) */
+  /** price_... — the price this link sells (fixed after creation) */
   price_id: string;
   title: string | null;
   description: string | null;
   collect_email: boolean;
   email_required: boolean;
-  /** CAIP-2 목록 또는 null(legacy) */
+  /** CAIP-2 list, or null (legacy) */
   allowed_pay_chains: string[] | null;
-  /** chain×token cell 목록 또는 null */
+  /** chain×token cell list, or null */
   allowed_assets: Array<{ caip2: string; token: string }> | null;
   success_url: string | null;
   cancel_url: string | null;
@@ -465,17 +520,17 @@ export interface CheckoutPaymentLink {
 }
 
 export interface CreatePaymentLinkParams {
-  /** price_... — bitpal.checkout.prices.create() 로 만든 가격. 필수. */
+  /** price_... — a price created with bitpal.checkout.prices.create(). Required. */
   price_id: string;
   title?: string;
   description?: string;
-  /** buyer 이메일 수집(기본 true) */
+  /** Collect buyer email (default true) */
   collect_email?: boolean;
-  /** buyer 이메일 필수(기본 true). true 면 collect_email 도 true 여야 함. */
+  /** Require buyer email (default true). If true, collect_email must also be true. */
   email_required?: boolean;
-  /** 허용 결제 체인(CAIP-2 또는 short-name). allowed_assets 가 있으면 그쪽 우선. */
+  /** Allowed payment chains (CAIP-2 or short name). allowed_assets takes precedence if set. */
   allowed_pay_chains?: string[];
-  /** chain×token cell 허용 목록 — allowed_pay_chains 보다 우선. */
+  /** Allowed chain×token cells — takes precedence over allowed_pay_chains. */
   allowed_assets?: Array<{ chain: string; token: string }>;
   success_url?: string;
   cancel_url?: string;

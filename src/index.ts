@@ -1,7 +1,7 @@
 /**
  * @bitpal/checkout — BitPal Checkout SDK
  *
- * 체크아웃 세션 생성, 결제 링크 관리, 수수료 미리보기를 위한 공식 SDK
+ * Official SDK for creating checkout sessions, managing payment links, and previewing fees.
  *
  * @example
  * ```ts
@@ -10,11 +10,11 @@
  * const bitpal = new BitPal({ apiKey: 'bp_test_...' });
  *
  * const { data: session } = await bitpal.checkout.createSession({
- *   // amount: 사람 표기 USD("29","0.5"). decimal 계산 불필요 — 체인/토큰 decimal 무관.
+ *   // amount: human-readable decimal ("29", "0.5"); no decimals math needed, independent of chain/token decimals.
  *   line_items: [{ name: 'Pro Plan', amount: '29', currency: 'USDC' }],
  * });
  *
- * console.log(session.url); // 호스티드 결제 페이지 URL (checkout_url 별칭)
+ * console.log(session.url); // hosted payment page URL (alias of checkout_url)
  * ```
  */
 
@@ -27,17 +27,20 @@ export type {
   CheckoutLineItemInput,
   CreateSessionParams,
   CheckoutSession,
+  CheckoutLatePayments,
+  CheckoutRefundKind,
+  CheckoutRefundRecord,
   FeePreview,
   IdempotencyOptions,
   ApiResponse,
   ListResponse,
-  // 안2 비수탁 입금주소 결제
+  // Non-custodial deposit-address payments
   PublicSession,
   SessionStatus,
   PaymentOption,
   IssueDepositAddressParams,
   DepositAddress,
-  // PROD-LINK-3a-SDK: Product/immutable Price 관리
+  // Products / immutable Prices
   CheckoutProduct,
   CheckoutPrice,
   CreateProductParams,
@@ -46,7 +49,7 @@ export type {
   UpdatePriceParams,
   ListProductsParams,
   ListPricesParams,
-  // PROD-LINK-4-SDK: Payment Link 관리
+  // Payment Links
   CheckoutPaymentLink,
   CreatePaymentLinkParams,
   UpdatePaymentLinkParams,
@@ -60,11 +63,26 @@ export {
   CHECKOUT_WEBHOOK_EVENTS,
   WEBHOOK_HEADERS,
 } from './webhook.js';
-export type { CheckoutWebhookEvent, WebhookPayload } from './webhook.js';
+export type {
+  CheckoutWebhookEvent,
+  WebhookPayload,
+  WebhookEvent,
+  WebhookEventDataMap,
+  WebhookSessionMetadata,
+  CheckoutSessionEventBase,
+  CheckoutSessionCreatedData,
+  CheckoutSessionDepositDetectedData,
+  CheckoutSessionPaidData,
+  CheckoutSessionSettledData,
+  CheckoutSessionUnresolvedData,
+  CheckoutSessionExpiredData,
+  CheckoutRefundRecordedData,
+  X402PaymentResolvedData,
+} from './webhook.js';
 
 export { toAtomic, fromAtomic, toAtomicUSDC, fromAtomicUSDC } from './amount.js';
 
-// x402 — 호출당 과금 레인. 머천트(미들웨어)와 payer(서명 헬퍼) 양쪽을 한 패키지에서 제공한다.
+// x402 — pay-per-call lane. Provides both the merchant side (middleware) and the payer side (signing helper).
 export {
   x402,
   X402Gate,
@@ -100,12 +118,12 @@ export type {
 } from './x402-pay.js';
 
 
-// 편의 팩토리
+// Convenience factory
 import { BitPalCheckoutClient } from './client.js';
 import type { BitPalConfig } from './types.js';
 
 /**
- * BitPal SDK 메인 엔트리
+ * BitPal SDK main entry point
  */
 export class BitPal {
   readonly checkout: BitPalCheckoutClient;

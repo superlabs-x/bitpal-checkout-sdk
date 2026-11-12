@@ -1,9 +1,9 @@
 /**
- * catalog.ts — Product / immutable Price 관리 리소스 (PROD-LINK-3a-SDK)
+ * catalog.ts — Product / immutable Price management resources
  *
- * server-side SDK 전용 (secret API key). 브라우저에서 사용 금지.
+ * Server-side only (secret API key). Do not use in the browser.
  *
- * 사용 예:
+ * Example:
  * ```ts
  * const bitpal = new BitPal({ apiKey: 'bp_test_...' });
  * const { data: product } = await bitpal.checkout.products.create({ name: 'Pro Plan' });
@@ -12,9 +12,9 @@
  * });
  * ```
  *
- * Price immutable 원칙: 가격 변경은 update가 아니라 "새 price 생성"이다.
- * `prices.update`는 nickname(표시 메타)만 받는다 — 금액류 필드 변경 helper는 의도적으로 없다.
- * "그만 팔기"는 Price 를 끄는 게 아니라 그 Price 를 쓰는 Payment Link 를 inactive 로 한다.
+ * Prices are immutable: to change a price, create a new price instead of updating it.
+ * `prices.update` only accepts nickname (display metadata) — there is intentionally no helper to change amount fields.
+ * To stop selling, set the Payment Link that uses the Price to inactive rather than disabling the Price.
  */
 import type {
   ApiResponse,
@@ -34,7 +34,7 @@ import type {
   ListPaymentLinksParams,
 } from './types.js';
 
-/** client.ts의 private request를 리소스에 주입하기 위한 시그니처 */
+/** Signature used to inject the client's request function into resources */
 export type CatalogRequester = <T>(method: string, path: string, body?: unknown, options?: IdempotencyOptions) => Promise<T>;
 
 function toQuery(params?: object): string {
@@ -49,7 +49,7 @@ function toQuery(params?: object): string {
 export class ProductsResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/products — options.idempotencyKey 를 주면 Idempotency-Key 헤더로 보낸다(재시도 안전). */
+  /** POST /v1/checkout/products — pass options.idempotencyKey to send an Idempotency-Key header (safe retries). */
   create(params: CreateProductParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutProduct>> {
     return this.request('POST', '/v1/checkout/products', params, options);
   }
@@ -73,7 +73,7 @@ export class ProductsResource {
 export class PricesResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/products/:id/prices — options.idempotencyKey 지원. */
+  /** POST /v1/checkout/products/:id/prices — supports options.idempotencyKey. */
   create(productId: string, params: CreatePriceParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutPrice>> {
     return this.request('POST', `/v1/checkout/products/${encodeURIComponent(productId)}/prices`, params, options);
   }
@@ -89,10 +89,10 @@ export class PricesResource {
   }
 
   /**
-   * PATCH /v1/checkout/prices/:id — nickname(표시 메타)만.
-   * 금액류 필드(amount_atomic 등)는 immutable — 서버가 PRICE_IMMUTABLE_FIELD로 거부한다.
-   * 가격 변경은 `prices.create()`로 새 price를 만들 것. "그만 팔기"는 해당 Price 를 쓰는
-   * Payment Link 를 inactive 로 한다(Price 자체에는 active/inactive 개념이 없다).
+   * PATCH /v1/checkout/prices/:id — nickname (display metadata) only.
+   * Amount fields (amount_atomic etc.) are immutable — the server rejects them with PRICE_IMMUTABLE_FIELD.
+   * To change a price, create a new one with `prices.create()`. To stop selling, set the Payment Link that
+   * uses the Price to inactive (Prices themselves have no active/inactive state).
    */
   update(priceId: string, params: UpdatePriceParams): Promise<ApiResponse<CheckoutPrice>> {
     return this.request('PATCH', `/v1/checkout/prices/${encodeURIComponent(priceId)}`, params);
@@ -100,9 +100,9 @@ export class PricesResource {
 }
 
 /**
- * Payment Link 리소스 — 대시보드 없이 코드로 결제 링크 생성/관리 (PROD-LINK-4).
+ * Payment Link resource — create and manage payment links in code, without the dashboard.
  *
- * 흐름: product 생성 → price 생성 → payment link 생성. link↔price binding 은 생성 후 고정.
+ * Flow: create product -> create price -> create payment link. The link<->price binding is fixed after creation.
  *
  * ```ts
  * const { data: product } = await bitpal.checkout.products.create({ name: 'Pro Plan' });
@@ -111,13 +111,13 @@ export class PricesResource {
  *   price_id: price.id,
  *   allowed_pay_chains: ['eip155:8453', 'solana:5eykt4Us…'],
  * });
- * // 호스티드 결제 페이지 URL: `{checkoutBase}/plink/${link.share_token}`
+ * // Hosted payment page URL: `{checkoutBase}/plink/${link.share_token}`
  * ```
  */
 export class PaymentLinksResource {
   constructor(private readonly request: CatalogRequester) {}
 
-  /** POST /v1/checkout/payment-links — options.idempotencyKey 지원. */
+  /** POST /v1/checkout/payment-links — supports options.idempotencyKey. */
   create(params: CreatePaymentLinkParams, options?: IdempotencyOptions): Promise<ApiResponse<CheckoutPaymentLink>> {
     return this.request('POST', '/v1/checkout/payment-links', params, options);
   }
