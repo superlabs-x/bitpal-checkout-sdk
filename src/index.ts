@@ -18,8 +18,8 @@
  * ```
  */
 
-export { BitPalCheckoutClient, BitPalError, parseApiErrorBody } from './client.js';
-export type { BitPalErrorDetails } from './client.js';
+export { BitPalCheckoutClient, BitPalError, parseApiErrorBody, TRANSPORT_ERROR_CODES } from './client.js';
+export type { BitPalErrorDetails, TransportErrorCode } from './client.js';
 export type {
   BitPalConfig,
   LineItem,
@@ -54,8 +54,31 @@ export type {
   CreatePaymentLinkParams,
   UpdatePaymentLinkParams,
   ListPaymentLinksParams,
+  // Reconciliation reports
+  CheckoutReportKind,
+  CheckoutReportRange,
+  CheckoutReportParams,
+  CheckoutReportSummary,
+  CheckoutReportResponse,
+  CheckoutReportRowBase,
+  PaymentReportRow,
+  PayoutReportRow,
+  FeeReportRow,
+  // Webhook endpoint management (API keys: test mode only)
+  WebhookSubscribableEvent,
+  WebhookRetryPolicy,
+  WebhookEndpoint,
+  WebhookEndpointWithSecret,
+  CreateWebhookEndpointParams,
+  UpdateWebhookEndpointParams,
+  RotateWebhookSecretParams,
+  ListWebhookEndpointsParams,
+  WebhookReasonCode,
+  WebhookDelivery,
 } from './types.js';
 export { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
+export { ReportsResource } from './reports.js';
+export { WebhookEndpointsResource } from './webhook-endpoints.js';
 
 export {
   verifyWebhookSignature,

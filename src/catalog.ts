@@ -109,7 +109,7 @@ export class PricesResource {
  * const { data: price }   = await bitpal.checkout.prices.create(product.id, { amount: '29' });
  * const { data: link }    = await bitpal.checkout.paymentLinks.create({
  *   price_id: price.id,
- *   allowed_pay_chains: ['eip155:8453', 'solana:5eykt4Us…'],
+ *   allowed_pay_chains: ['eip155:8453', 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'],
  * });
  * // Hosted payment page URL: `{checkoutBase}/plink/${link.share_token}`
  * ```

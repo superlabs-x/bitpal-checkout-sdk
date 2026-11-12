@@ -195,7 +195,7 @@ export interface CheckoutSession {
  * calls `issueDepositAddress({ chain, token })` to get a deposit address. Single-asset sessions have exactly one.
  */
 export interface PaymentOption {
-  /** CAIP-2 (e.g. eip155:8453, tron:0x2b6653dc, solana:5eykt4…). Canonical chain identifier. */
+  /** CAIP-2 (e.g. eip155:8453, tron:0x2b6653dc, solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp). Canonical chain identifier. */
   caip2: string;
   /** EVM numeric chainId. null for non-EVM (Tron/Solana) — use caip2 to identify. */
   chain_id: number | null;
@@ -207,12 +207,17 @@ export interface PaymentOption {
   /** Exact amount to send in this token (atomic, in this token's decimals). */
   amount_atomic?: string;
   /**
-   * false = shown in the list but not selectable yet (see `unavailable_reason`). Calling `issueDepositAddress` with
-   * this option returns 409 `CHECKOUT_CHAIN_COMING_SOON`. Added in 0.13.0 — optional because older API responses may omit it.
+   * false = shown in the list but not selectable right now (see `unavailable_reason`). Calling `issueDepositAddress` with
+   * this option returns 409 `CHECKOUT_CHAIN_COMING_SOON` (`coming_soon`) or 503 `NETWORK_PAUSED` (`paused`).
+   * Added in 0.13.0 — optional because older API responses may omit it.
    */
   available?: boolean;
-  /** Why the option is not selectable. `coming_soon` = payments on this network open soon. null when selectable. */
-  unavailable_reason?: 'coming_soon' | null;
+  /**
+   * Why the option is not selectable. null when selectable.
+   * - `coming_soon` — payments on this network open soon.
+   * - `paused` — new payments on this network are temporarily paused by BitPal; it becomes selectable again when resumed.
+   */
+  unavailable_reason?: 'coming_soon' | 'paused' | null;
 }
 
 /**
@@ -270,6 +275,8 @@ export interface PublicSession {
   paid_at: string | null;
   settled_at: string | null;
   created_at: string;
+  /** Your organization name (Console → Settings → Organization) as shown to the buyer. null if not set. */
+  merchant_name?: string | null;
   line_items: LineItem[];
 }
 
@@ -549,14 +556,179 @@ export interface UpdatePaymentLinkParams {
   allowed_assets?: Array<{ chain: string; token: string }> | null;
   success_url?: string | null;
   cancel_url?: string | null;
+  /**
+   * Deactivating (`'inactive'`): the console asks for a reason; with an API key `reason_code` is optional —
+   * without it the change is recorded as `api_request`.
+   */
   status?: 'active' | 'inactive';
   max_uses?: number | null;
   expires_at?: string | null;
   metadata?: Record<string, unknown>;
+  /** Why the status changes — optional with an API key (recorded as `api_request` when omitted). Recorded in your audit log. */
+  reason_code?: 'user_request' | 'security_concern' | 'rotation' | 'no_longer_needed' | 'other';
+  /** Optional free-text note for the status change (max 500 characters). */
+  reason_note?: string;
 }
 
 export interface ListPaymentLinksParams {
   status?: 'active' | 'inactive';
   limit?: number;
   offset?: number;
+}
+
+// ── Reconciliation reports (server-side) ──
+
+/** Report type for `reports.csv()`. */
+export type CheckoutReportKind = 'payments' | 'payouts' | 'fees';
+
+/** Date range, UTC dates `YYYY-MM-DD`, both inclusive. Omit a bound for no limit on that side. */
+export interface CheckoutReportRange {
+  from?: string;
+  to?: string;
+}
+
+/** JSON report page. `limit` 1–100 (default 50). */
+export interface CheckoutReportParams extends CheckoutReportRange {
+  limit?: number;
+  offset?: number;
+}
+
+/** Totals over the whole date range (not just the page). 6-decimal atomic strings; currencies are added together. */
+export interface CheckoutReportSummary {
+  total_count: number;
+  total_amount_atomic: string;
+  total_fees_atomic: string;
+  total_net_atomic: string;
+}
+
+export interface CheckoutReportResponse<Row> {
+  data: Row[];
+  meta: ListMeta & { total: number; limit: number; offset: number };
+  summary: CheckoutReportSummary;
+}
+
+/** Fields shared by every report row. Amount fields are atomic integer strings. */
+export interface CheckoutReportRowBase {
+  session_id: string;
+  currency: string;
+  /** 6-decimal ("29000000" = 29). */
+  amount_total: string;
+  pay_chain: string | null;
+  pay_asset: string | null;
+  /** Platform fee, 6-decimal. */
+  fee_amount: string | null;
+  /** Your net, 6-decimal. */
+  net_amount: string | null;
+  /** Payment token decimals (USDC/USDT = 6, BSC-USD = 18). */
+  token_decimals: number | null;
+  /** Platform fee in the payment token's atomic units — matches the on-chain transfer exactly. */
+  fee_amount_token: string | null;
+  /** Your net in the payment token's atomic units — matches the on-chain sweep exactly. */
+  net_amount_token: string | null;
+  /** The metadata you set on the session (BitPal's reserved keys removed). */
+  metadata: Record<string, unknown>;
+}
+
+/** `reports.payments()` row — every session created in the range. */
+export interface PaymentReportRow extends CheckoutReportRowBase {
+  created_at: string;
+  paid_at: string | null;
+  settled_at: string | null;
+  status: string;
+  /** In `token_decimals` units. */
+  amount_received: string | null;
+  payer_wallet: string | null;
+  deposit_tx_hash: string | null;
+  sweep_tx_hash: string | null;
+  fee_rate: string | null;
+}
+
+/** `reports.payouts()` row — every session settled in the range. */
+export interface PayoutReportRow extends CheckoutReportRowBase {
+  settled_at: string;
+  paid_at: string | null;
+  deposit_tx_hash: string | null;
+  sweep_tx_hash: string | null;
+}
+
+/** `reports.fees()` row — every session paid in the range. */
+export interface FeeReportRow extends CheckoutReportRowBase {
+  paid_at: string;
+  fee_rate: string | null;
+}
+
+// ── Webhook endpoint management (server-side; API keys: test mode only) ──
+
+/** Event names an endpoint can subscribe to, or `'*'` for every event. */
+export type WebhookSubscribableEvent = '*' | import('./webhook.js').CheckoutWebhookEvent;
+
+export interface WebhookRetryPolicy {
+  /** Total delivery attempts (1–20, default 10). */
+  max_retries?: number;
+  /** Ignored — the retry schedule is fixed. */
+  backoff?: 'exponential' | 'linear' | 'fixed';
+}
+
+export interface WebhookEndpoint {
+  id: string;
+  mode: 'TEST' | 'LIVE';
+  endpoint_url: string;
+  subscribed_events: string[];
+  retry_policy: WebhookRetryPolicy;
+  dead_letter_destination: string | null;
+  status: 'active' | 'paused' | 'disabled';
+  created_at: string;
+  updated_at: string;
+}
+
+/** Returned by `create` and `rotateSecret` only. */
+export interface WebhookEndpointWithSecret extends WebhookEndpoint {
+  /** `whsec_…` signing secret — shown only once. */
+  secret: string;
+}
+
+export interface CreateWebhookEndpointParams {
+  endpoint_url: string;
+  subscribed_events: WebhookSubscribableEvent[];
+  retry_policy?: WebhookRetryPolicy;
+  dead_letter_destination?: string | null;
+}
+
+export type WebhookReasonCode = 'user_request' | 'security_concern' | 'rotation' | 'no_longer_needed' | 'other';
+
+export interface UpdateWebhookEndpointParams {
+  endpoint_url?: string;
+  subscribed_events?: WebhookSubscribableEvent[];
+  /** `'disabled'` removes the endpoint. */
+  status?: 'active' | 'paused' | 'disabled';
+  retry_policy?: WebhookRetryPolicy;
+  dead_letter_destination?: string | null;
+  /** Why the endpoint is disabled. Optional with a test API key (recorded as `api_request`); required in the console. */
+  reason_code?: WebhookReasonCode;
+  reason_note?: string;
+}
+
+export interface RotateWebhookSecretParams {
+  /** Optional with a test API key (recorded as `api_request`). */
+  reason_code?: WebhookReasonCode;
+  reason_note?: string;
+}
+
+export interface ListWebhookEndpointsParams {
+  limit?: number;
+  offset?: number;
+}
+
+/** A queued delivery (from `replay`). */
+export interface WebhookDelivery {
+  /** Sent as `X-Webhook-Delivery-Id`. */
+  id: string;
+  webhook_id: string;
+  /** The event's envelope `id` — unchanged, so your dedup still applies. */
+  event_id: string;
+  event_type: string;
+  status: string;
+  attempt_count: number;
+  replayed_from_event_id: string | null;
+  created_at: string;
 }

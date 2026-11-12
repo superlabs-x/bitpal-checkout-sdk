@@ -20,6 +20,8 @@ import type {
   IdempotencyOptions,
 } from './types.js';
 import { ProductsResource, PricesResource, PaymentLinksResource } from './catalog.js';
+import { ReportsResource } from './reports.js';
+import { WebhookEndpointsResource } from './webhook-endpoints.js';
 
 /**
  * Idempotency key -> `Idempotency-Key` header. For every merchant POST the API returns the first response to retries
@@ -88,6 +90,10 @@ export class BitPalCheckoutClient {
   readonly prices: PricesResource;
   /** Payment Link management — create payment links in code without the dashboard (server-side only) */
   readonly paymentLinks: PaymentLinksResource;
+  /** Reconciliation reports — payments, payouts and fees for a date range, as JSON pages or CSV (server-side only) */
+  readonly reports: ReportsResource;
+  /** Webhook endpoint management — with an API key, test mode only (`bp_live_` keys get 403; live endpoints are console-only) */
+  readonly webhooks: WebhookEndpointsResource;
 
   constructor(config: BitPalConfig) {
     // apiKey is optional — server methods need it (the server returns 401 otherwise); public methods work without it.
@@ -100,6 +106,8 @@ export class BitPalCheckoutClient {
     this.products = new ProductsResource(requester);
     this.prices = new PricesResource(requester);
     this.paymentLinks = new PaymentLinksResource(requester);
+    this.reports = new ReportsResource(requester, (path) => this.request<string>('GET', path, undefined, undefined, 'text'));
+    this.webhooks = new WebhookEndpointsResource(requester);
   }
 
   /* ─── Internal HTTP ─── */
@@ -110,26 +118,35 @@ export class BitPalCheckoutClient {
     path: string,
     body?: unknown,
     extraHeaders?: Record<string, string>,
+    responseType: 'json' | 'text' = 'json',
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
 
     try {
-      const res = await fetch(url, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          // Public methods (session_token based) work without an apiKey — attach Authorization only when present.
-          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
-          ...(extraHeaders ?? {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-
-      // Proxy/gateway errors (e.g. HTML 502) are not JSON — don't let the parse failure surface as a SyntaxError.
-      const text = await res.text();
+      let res: Response;
+      let text: string;
+      try {
+        res = await fetch(url, {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            // Public methods (session_token based) work without an apiKey — attach Authorization only when present.
+            ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+            ...(extraHeaders ?? {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
+        // Proxy/gateway errors (e.g. HTML 502) are not JSON — don't let the parse failure surface as a SyntaxError.
+        text = await res.text();
+      } catch (err) {
+        // fetch rejects (DNS, connection reset, TLS) or our timeout aborts — surface it as a BitPalError, not a raw TypeError/AbortError.
+        throw toTransportError(err, controller.signal.aborted, this.timeout, method, path);
+      }
+      // Text responses (CSV reports): return the body as-is on success; errors are still JSON.
+      if (responseType === 'text' && res.ok) return text as T;
       let json: unknown = null;
       try {
         json = text ? JSON.parse(text) : null;
@@ -336,16 +353,46 @@ export interface BitPalErrorDetails {
   retryable?: boolean;
   /** Server trace id — include it when contacting support. */
   traceId?: string;
+  /** Underlying error (e.g. the `TypeError` from `fetch`) for transport failures. Exposed as `Error.cause`. */
+  cause?: unknown;
+}
+
+/**
+ * Error codes for requests that got no HTTP response (`statusCode` 0):
+ * - `NETWORK_ERROR` — fetch failed (DNS, connection refused/reset, TLS). Retryable.
+ * - `REQUEST_TIMEOUT` — no response within `timeout` ms (default 30000). Retryable.
+ * - `REQUEST_ABORTED` — the request was aborted by something other than the SDK timeout. Not retryable.
+ * The request may still have reached the server — retry a POST with the same `idempotencyKey` so it is not applied twice.
+ */
+export const TRANSPORT_ERROR_CODES = ['NETWORK_ERROR', 'REQUEST_TIMEOUT', 'REQUEST_ABORTED'] as const;
+export type TransportErrorCode = (typeof TRANSPORT_ERROR_CODES)[number];
+
+function toTransportError(err: unknown, timedOut: boolean, timeoutMs: number, method: string, path: string): BitPalError {
+  if (err instanceof BitPalError) return err;
+  const isAbort = err instanceof Error && err.name === 'AbortError';
+  const detail = err instanceof Error && err.message ? `: ${err.message}` : '';
+  if (timedOut) {
+    return new BitPalError(`Request timed out after ${timeoutMs}ms (${method} ${path})`, 0, {
+      code: 'REQUEST_TIMEOUT',
+      retryable: true,
+      cause: err,
+    });
+  }
+  if (isAbort) {
+    return new BitPalError(`Request aborted (${method} ${path})`, 0, { code: 'REQUEST_ABORTED', retryable: false, cause: err });
+  }
+  return new BitPalError(`Network error (${method} ${path})${detail}`, 0, { code: 'NETWORK_ERROR', retryable: true, cause: err });
 }
 
 export class BitPalError extends Error {
+  /** HTTP status. `0` when no response was received (`NETWORK_ERROR`, `REQUEST_TIMEOUT`, `REQUEST_ABORTED`). */
   readonly statusCode: number;
   readonly code?: string;
   readonly apiMessage?: string;
   readonly retryable?: boolean;
   readonly traceId?: string;
   constructor(message: string, statusCode: number, details: BitPalErrorDetails = {}) {
-    super(message);
+    super(message, details.cause !== undefined ? { cause: details.cause } : undefined);
     this.name = 'BitPalError';
     this.statusCode = statusCode;
     this.code = details.code;

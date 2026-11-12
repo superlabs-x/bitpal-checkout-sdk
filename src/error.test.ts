@@ -52,3 +52,45 @@ describe('BitPalError — API error body parsing', () => {
     expect(parseApiErrorBody({ error: 'not found' }).code).toBeUndefined();
   });
 });
+
+describe('BitPalError — transport failures (no HTTP response)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('fetch rejection (TypeError) → NETWORK_ERROR, status 0, retryable, cause kept', async () => {
+    const cause = new TypeError('fetch failed');
+    vi.stubGlobal('fetch', vi.fn(async () => { throw cause; }));
+    const err = await catchErr(new BitPalCheckoutClient({ apiKey: 'bp_test_x' }).getSession('cs_1'));
+    expect(err.code).toBe('NETWORK_ERROR');
+    expect(err.statusCode).toBe(0);
+    expect(err.retryable).toBe(true);
+    expect(err.cause).toBe(cause);
+    expect(err.message).toContain('GET /v1/checkout/sessions/cs_1');
+  });
+
+  it('SDK timeout → REQUEST_TIMEOUT, retryable', async () => {
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new DOMException('This operation was aborted', 'AbortError')));
+    })));
+    const err = await catchErr(new BitPalCheckoutClient({ apiKey: 'bp_test_x', timeout: 5 }).getSession('cs_1'));
+    expect(err.code).toBe('REQUEST_TIMEOUT');
+    expect(err.statusCode).toBe(0);
+    expect(err.retryable).toBe(true);
+    expect(err.message).toContain('5ms');
+  });
+
+  it('AbortError not caused by the SDK timeout → REQUEST_ABORTED, not retryable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('aborted', 'AbortError'); }));
+    const err = await catchErr(new BitPalCheckoutClient({ apiKey: 'bp_test_x' }).getSession('cs_1'));
+    expect(err.code).toBe('REQUEST_ABORTED');
+    expect(err.retryable).toBe(false);
+  });
+
+  it('body read failure after headers → NETWORK_ERROR', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, text: async () => { throw new TypeError('terminated'); } })));
+    const err = await catchErr(new BitPalCheckoutClient({ apiKey: 'bp_test_x' }).getSession('cs_1'));
+    expect(err.code).toBe('NETWORK_ERROR');
+  });
+});
