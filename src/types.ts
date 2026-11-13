@@ -128,6 +128,9 @@ export interface CreateSessionParams {
   late_payments?: CheckoutLatePayments;
 }
 
+/** Merchant refund state of a session. See `CheckoutSession.refund_status`. */
+export type CheckoutSessionRefundStatus = 'none' | 'partially_refunded' | 'refunded';
+
 /** Session option for full payments that arrive after the deadline. See `CreateSessionParams.late_payments`. */
 export type CheckoutLatePayments = 'accept' | 'refund';
 
@@ -170,6 +173,12 @@ export interface CheckoutSession {
   deposit_tx_hash?: string | null;
   /** The settlement to your payout wallet (or the refund/rescue for a refunded session). */
   sweep_tx_hash?: string | null;
+  /**
+   * Refunds you sent from your own wallet and recorded in the console (`kind: 'merchant'`).
+   * `status` stays `settled` after a refund — check this field. Automatic refunds (overpaid excess,
+   * expired underpayment, wrong token) do not count. Present in retrieval responses.
+   */
+  refund_status?: CheckoutSessionRefundStatus;
   fee_amount?: string | null;
   fee_rate?: string | null;
   net_amount?: string | null;
@@ -361,10 +370,17 @@ export type CheckoutRefundKind = 'overpay_excess' | 'underpay_expired' | 'wrong_
 export interface CheckoutRefundRecord {
   session_id?: string;
   kind: CheckoutRefundKind | (string & {});
-  /** Atomic integer string in the token's own decimals. */
+  /**
+   * Atomic integer string in the refunded token's own decimals — see `token_decimals`
+   * (BNB Chain USDC/USDT and JPYC = 18, while the session's `amount_total` is always 6-decimal).
+   */
   amount: string;
   /** Token contract / mint address. */
   token: string;
+  /** Symbol of `token` (e.g. `USDC`). null if BitPal does not know the token. */
+  token_symbol?: string | null;
+  /** Decimals of `amount`. null if BitPal does not know the token. */
+  token_decimals?: number | null;
   tx_hash: string;
   refund_address: string;
   /** `merchant` only: the wallet the refund was sent from. */

@@ -57,6 +57,19 @@ export interface CheckoutSessionEventBase {
   [key: string]: unknown;
 }
 
+/**
+ * Deposit fields on `deposit_detected`, `paid`, `unresolved`, `settled` and `expired` — same names as on the session.
+ * `tx_hash` is still sent with the same value as `deposit_tx_hash` for compatibility.
+ */
+export interface CheckoutSessionDepositFields {
+  /** The buyer's payment into the deposit address. null when nothing was received. */
+  deposit_tx_hash?: string | null;
+  /** Symbol of the token received (e.g. `USDC`). */
+  received_token_symbol?: string | null;
+  /** Decimals of `amount_received` / `amount_expected` (USDC/USDT = 6; BNB Chain USDC/USDT and JPYC = 18). `amount_total` is always 6-decimal. */
+  token_decimals?: number | null;
+}
+
 /** `checkout.session.created` */
 export type CheckoutSessionCreatedData = CheckoutSessionEventBase;
 
@@ -64,7 +77,8 @@ export type CheckoutSessionCreatedData = CheckoutSessionEventBase;
  * `checkout.session.deposit_detected` — funds seen, waiting for confirmations. Optional: skipped when the deposit is
  * already confirmed the first time BitPal sees it, so never wait for it.
  */
-export interface CheckoutSessionDepositDetectedData extends CheckoutSessionEventBase {
+export interface CheckoutSessionDepositDetectedData extends CheckoutSessionEventBase, CheckoutSessionDepositFields {
+  /** Same as `deposit_tx_hash`. */
   tx_hash: string;
   /** Atomic amount in the pay token's own decimals. */
   amount_received: string;
@@ -73,32 +87,48 @@ export interface CheckoutSessionDepositDetectedData extends CheckoutSessionEvent
 }
 
 /** `checkout.session.paid` — confirmed, safe to fulfil. */
-export interface CheckoutSessionPaidData extends CheckoutSessionEventBase {
+export interface CheckoutSessionPaidData extends CheckoutSessionEventBase, CheckoutSessionDepositFields {
+  /** Same as `deposit_tx_hash`. */
   tx_hash?: string;
 }
 
 /** `checkout.session.settled` — swept to your payout wallet. */
-export interface CheckoutSessionSettledData extends CheckoutSessionEventBase {
+export interface CheckoutSessionSettledData extends CheckoutSessionEventBase, CheckoutSessionDepositFields {
   sweep_tx_hash?: string;
 }
 
-/** `checkout.session.unresolved` — see `reason`. */
-export interface CheckoutSessionUnresolvedData extends CheckoutSessionEventBase {
-  reason: 'underpaid' | 'overpaid' | 'wrong_token' | 'reorg' | (string & {});
+/**
+ * `checkout.session.unresolved` — see `reason`:
+ * - `underpaid`: less than the amount arrived; the buyer can top up until the deadline.
+ * - `late`: a full payment arrived after the deadline on a session created with `late_payments: 'refund'`. It is not
+ *   accepted and is refunded to the buyer automatically at `refund_available_at` (`checkout.refund.recorded`,
+ *   kind `late_deposit`). Sent once.
+ * - `reorg`: a confirmed deposit was reverted.
+ * - `wrong_token`: sessions created before 2026-11-12 only.
+ */
+export interface CheckoutSessionUnresolvedData extends CheckoutSessionEventBase, CheckoutSessionDepositFields {
+  reason: 'underpaid' | 'late' | 'reorg' | 'wrong_token' | (string & {});
   /** `underpaid`: the expected amount in the pay token's decimals. */
   amount_expected?: string;
   amount_received?: string;
   received_token?: string;
+  /** Same as `deposit_tx_hash`. */
   tx_hash?: string;
+  /** `late`: when the automatic refund becomes possible (about 7 days after the deadline). */
+  refund_available_at?: string;
 }
 
 /** `checkout.session.expired` — the deadline passed without a full payment. */
-export interface CheckoutSessionExpiredData extends CheckoutSessionEventBase {
-  /** Set when nothing was paid. */
-  reason?: 'no_deposit' | (string & {});
+export interface CheckoutSessionExpiredData extends CheckoutSessionEventBase, CheckoutSessionDepositFields {
+  /**
+   * `no_deposit` = nothing was paid. `underpaid` = still short at the deadline; what was received is refunded.
+   * `late_payment_refunded` = a full payment arrived after the late-acceptance cutoff and was refunded.
+   */
+  reason?: 'no_deposit' | 'underpaid' | 'late_payment_refunded' | (string & {});
   expired_at?: string;
-  source?: 'lazy' | 'cron' | (string & {});
-  /** Set when a partial payment was refunded. */
+  /** What noticed the expiry. Informational. */
+  source?: 'lazy' | 'cron' | 'deposit_scan' | (string & {});
+  /** Set when what was received was refunded. */
   refund_tx_hash?: string;
 }
 

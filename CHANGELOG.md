@@ -8,6 +8,20 @@ Source of truth: the BitPal monorepo (`packages/checkout-sdk`). The public repo 
 
 _Nothing yet._
 
+## 0.16.0 — 2026-11-13
+
+### Added
+- `CheckoutSession.refund_status` (`'none' | 'partially_refunded' | 'refunded'`, type `CheckoutSessionRefundStatus`) — refunds you recorded in the console. `status` stays `swept` after a refund; read this field instead.
+- Webhook data types: `CheckoutSessionDepositFields` (`deposit_tx_hash`, `received_token_symbol`, `token_decimals`) on `deposit_detected`, `paid`, `unresolved`, `settled` and `expired`; `CheckoutSessionUnresolvedData.reason` adds `'late'` with `refund_available_at`; `CheckoutSessionExpiredData.reason` adds `'underpaid'` and `'late_payment_refunded'`, `source` adds `'deposit_scan'`; `CheckoutRefundRecord.token_symbol` / `token_decimals`.
+
+### API (applies to every SDK version once the API is deployed)
+- Deposit webhooks (`deposit_detected`, `paid`, `unresolved`, `settled`, `expired`) now also carry `deposit_tx_hash`, `received_token_symbol` and `token_decimals` — the same names as on the session. `tx_hash` is still sent with the same value.
+- `checkout.refund.recorded` adds `token_symbol` and `token_decimals`. `amount` is in the refunded token's own decimals (18 on BNB Chain USDC/USDT and JPYC), while `amount_total` is always 6-decimal.
+- `checkout.session.expired` now always has `reason` (`no_deposit` · `underpaid` · `late_payment_refunded`), `expired_at` and `source` (`lazy` · `cron` · `deposit_scan`). Before, only expiries without a deposit address had `expired_at`/`source`, and an underpaid expiry had only `refund_tx_hash`.
+- `late_payments: "refund"`: when a full payment arrives after the deadline you now get `checkout.session.unresolved` with `reason: "late"` and `refund_available_at` right away (once), instead of nothing until the refund about 7 days later.
+- Session responses add `refund_status`.
+- Sandbox `simulate`: a session whose deposit address was issued and that then expired unpaid can now be paid (`exact` / `overpay` / `underpay`) to test late payments. A scenario the chain cannot run (`wrong_token` without a second test token) is rejected before a deposit address is issued, and the 400 lists the chains that support it (`details.supported_chains`).
+
 ## 0.15.0 — 2026-11-12
 
 ### Added
