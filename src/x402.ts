@@ -20,6 +20,18 @@
 
 import { BitPalError } from './client.js';
 import type { ApiResponse } from './types.js';
+import {
+  decodePaymentSignatureHeader,
+  encodePaymentRequiredHeader,
+  encodePaymentResponseHeaderV2,
+  X402_PAYMENT_REQUIRED_CACHE_CONTROL,
+  X402_PAYMENT_REQUIRED_HEADER,
+  X402_PAYMENT_RESPONSE_HEADER_V2,
+  X402_PAYMENT_SIGNATURE_HEADER,
+  type X402UptoAccept,
+  type X402UptoPaymentPayload,
+  type X402UptoRequirements,
+} from './x402-v2.js';
 
 /* ─── Constants ─── */
 
@@ -189,6 +201,17 @@ export function createMemoryReplayStore(): X402ReplayStore {
 export interface X402GateOptions {
   /** Your `bp_test_…` / `bp_live_…` API key. The prefix selects the network (test/live). */
   apiKey: string;
+  /**
+   * Pricing model for this route. Defaults to `'exact'`.
+   *
+   * - `'exact'` — fixed price, settled before the handler runs. x402 v1 / EIP-3009.
+   * - `'upto'`  — the payer approves a **ceiling**; you charge the real amount after doing the work.
+   *   x402 v2 / Permit2, and a different wire format (see `x402-v2.ts`). `collect()` returns
+   *   `authorized` with a `charge()` to call once you know the usage.
+   *
+   * It is per route, not per merchant: `/download` is naturally `exact`, `/summarize` is `upto`.
+   */
+  scheme?: 'exact' | 'upto';
   /** Payout wallet. Must match the payout address registered in the console. */
   payTo: string;
   /**
@@ -227,9 +250,51 @@ export interface X402SettledPayment {
   idempotent: boolean;
 }
 
+/** What an `upto` route gets back once the ceiling is verified but nothing has been charged yet. */
+export interface X402Authorized {
+  kind: 'authorized';
+  /** Serve the resource. Same meaning as `settled`'s 200 — the difference is that nothing is charged yet. */
+  status: 200;
+  paymentId: string;
+  /** Payer address (`permit2Authorization.from`). */
+  payer: string;
+  /** Approval ceiling, atomic units. You cannot charge more than this. */
+  maxAmount: string;
+  network: string;
+  /**
+   * Charges the actual amount and settles on-chain. Call it once you know what the work cost.
+   *
+   * `amount` is human-readable (`'0.42'`) unless `atomic` is set. Charging `'0'` closes the payment
+   * without an on-chain transaction (`voided`) — correct when the work produced nothing billable.
+   *
+   * Set the returned `paymentResponseHeader` on the response under `PAYMENT-RESPONSE`.
+   */
+  charge: (amount: string, opts?: { atomic?: boolean }) => Promise<X402ChargeResult>;
+  /** Abandon without charging. Frees the claim so the payer can retry with the same header. */
+  release: () => Promise<void>;
+}
+
+export type X402ChargeResult =
+  | { kind: 'charged'; payment: X402SettledPayment; paymentResponseHeader: string }
+  /** Charged 0 — closed with no on-chain transaction. */
+  | { kind: 'voided'; paymentId: string }
+  /** Not certain whether funds moved. Do not ask the payer to re-sign; retry the same charge. */
+  | { kind: 'unconfirmed'; paymentId?: string; message: string };
+
 export type X402GateResult =
-  /** No payment or an invalid one — respond with 402 and the payment requirements. */
-  | { kind: 'payment_required'; status: 402; body: X402Requirements & { error?: string } }
+  /**
+   * No payment or an invalid one — respond with 402.
+   *
+   * `body` is the v1 payload. For `upto` the requirements go in `headers` instead
+   * (`PAYMENT-REQUIRED`), because a stock v2 client never reads the body — set every entry of
+   * `headers` on the response or stock agents will not see that payment is possible.
+   */
+  | {
+      kind: 'payment_required';
+      status: 402;
+      body: (X402Requirements & { error?: string }) | { error?: string };
+      headers?: Record<string, string>;
+    }
   /** This authorization has already been used to serve the resource — reuse rejected. */
   | { kind: 'already_used'; status: 409; body: { error: string; message: string } }
   /** Not yet certain whether funds moved — retry with the **same** `X-PAYMENT` (do not re-sign). */
@@ -248,7 +313,9 @@ export type X402GateResult =
       paymentResponseHeader: string;
       commit: () => Promise<void>;
       release: () => Promise<void>;
-    };
+    }
+  /** `upto` only — ceiling verified, nothing charged yet. Do the work, then call `charge()`. */
+  | X402Authorized;
 
 /**
  * Framework-agnostic x402 gate.
@@ -262,6 +329,7 @@ export class X402Gate {
   private readonly timeout: number;
   private readonly store: X402ReplayStore;
   private readonly maxTimeoutSeconds: number;
+  private readonly scheme: 'exact' | 'upto';
 
   constructor(opts: X402GateOptions) {
     if (!opts.apiKey) throw new Error('[BitPal] x402: apiKey is required.');
@@ -292,12 +360,19 @@ export class X402Gate {
     this.timeout = opts.timeout ?? DEFAULT_TIMEOUT;
     this.store = opts.replayStore ?? createMemoryReplayStore();
     this.maxTimeoutSeconds = opts.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS;
+    this.scheme = opts.scheme ?? 'exact';
   }
 
-  /** Fetches this resource's 402 body from the server (including the fee split). */
-  async requirements(resource: string): Promise<X402Requirements> {
-    return this.request<X402Requirements>('POST', '/v1/x402/requirements', {
+  /**
+   * Fetches this resource's 402 body from the server (including the fee split).
+   *
+   * The shape follows the scheme: `exact` returns the v1 body, `upto` the v2 one (top-level
+   * `resource` object, `accepts[]` without per-entry resource strings).
+   */
+  async requirements(resource: string): Promise<X402Requirements | X402UptoRequirements> {
+    return this.request<X402Requirements | X402UptoRequirements>('POST', '/v1/x402/requirements', {
       payTo: this.opts.payTo,
+      ...(this.scheme === 'upto' ? { scheme: 'upto' as const } : {}),
       // The server converts human-readable amounts to atomic units; the SDK does not need to know decimals.
       ...(this.opts.amount != null ? { amount: this.opts.amount } : { amountAtomic: this.opts.amountAtomic }),
       resource,
@@ -315,7 +390,14 @@ export class X402Gate {
    * Order matters: **claim → verify → settle → record consumption**. Claiming before verify ensures that
    * concurrent submissions of the same authorization result in only one request being served.
    */
-  async collect(input: { header?: string | null; resource: string }): Promise<X402GateResult> {
+  async collect(input: {
+    /** v1 `X-PAYMENT`. */
+    header?: string | null;
+    /** v2 `PAYMENT-SIGNATURE`. Required for `upto` — stock v2 clients never send `X-PAYMENT`. */
+    paymentSignature?: string | null;
+    resource: string;
+  }): Promise<X402GateResult> {
+    if (this.scheme === 'upto') return this.collectUpto(input);
     const { header, resource } = input;
     if (!header) return this.paymentRequired(resource);
 
@@ -474,10 +556,231 @@ export class X402Gate {
     };
   }
 
+  /**
+   * `upto` variant of `collect()`. The order is inverted on purpose.
+   *
+   * `exact` settles before the handler runs, because the price is already known. With `upto` the
+   * price *is* the thing the handler produces, so the gate can only verify the ceiling here and
+   * hand back a `charge()` to call afterwards. Everything else — claim-before-verify, releasing on
+   * failure, committing only after delivery — is kept identical, because those rules exist to stop
+   * one payment unlocking two responses and that risk does not depend on the scheme.
+   */
+  private async collectUpto(input: {
+    header?: string | null;
+    paymentSignature?: string | null;
+    resource: string;
+  }): Promise<X402GateResult> {
+    const { resource } = input;
+    // A stock v2 client sends PAYMENT-SIGNATURE. `header` is accepted as a courtesy for callers that
+    //   funnel both through one argument; X-PAYMENT is not part of v2.
+    const raw = input.paymentSignature ?? input.header;
+    if (!raw) return this.paymentRequiredUpto(resource);
+
+    let payload: X402UptoPaymentPayload;
+    try {
+      payload = decodePaymentSignatureHeader(raw);
+    } catch {
+      return this.paymentRequiredUpto(resource, 'MALFORMED_PAYMENT_SIGNATURE');
+    }
+    const auth = payload.payload.permit2Authorization;
+
+    // Scoped like Permit2's own uniqueness scope (chain + owner + nonce). The nonce is a 256-bit
+    //   value chosen by the signer, so it is compared as the decimal string the wire carries.
+    const key = `${normalizeX402Network(payload.accepted.network)}:${auth.from.toLowerCase()}:${auth.nonce}`;
+    const claim = await this.store.claim(key, this.maxTimeoutSeconds);
+    if (claim === 'used') {
+      return {
+        kind: 'already_used',
+        status: 409,
+        body: {
+          error: 'PAYMENT_ALREADY_USED',
+          message: 'This authorization has already been charged. One authorization unlocks one response.',
+        },
+      };
+    }
+    if (claim === 'inflight') {
+      return {
+        kind: 'unconfirmed',
+        status: 503,
+        body: {
+          error: 'PAYMENT_IN_PROGRESS',
+          message: 'This payment is still being processed. Retry with the same PAYMENT-SIGNATURE header.',
+        },
+      };
+    }
+
+    // Rebuilt server-side, never read from the payer's `accepted` — trusting it would let the payer
+    //   swap the ceiling or the destination.
+    let accept: X402UptoAccept;
+    let reqs: X402UptoRequirements;
+    try {
+      reqs = await this.uptoRequirements(resource);
+      const first = reqs.accepts[0];
+      if (!first) throw new BitPalError('[BitPal] x402: no upto payment option available for this API key mode.', 500);
+      accept = first;
+    } catch (err) {
+      await this.store.release(key);
+      throw err;
+    }
+
+    const envelope = (amount: string) => ({
+      x402Version: 2 as const,
+      paymentPayload: payload,
+      paymentRequirements: {
+        scheme: 'upto' as const,
+        asset: accept.asset,
+        payTo: accept.payTo,
+        // Merchant payout wallet, from our own config — the facilitator recomputes the forwarder
+        //   address from it and compares with the signed `witness.to`. Reading it from the 402 we
+        //   just fetched would make the check circular.
+        merchant: this.opts.payTo,
+        amount,
+        resource: reqs.resource.url,
+      },
+    });
+
+    let verified: { valid: boolean; payment_id: string; status: string };
+    try {
+      // Verified against the **ceiling** — "can this payer cover what they approved?".
+      verified = await this.request('POST', '/v1/x402/verify', envelope(accept.amount));
+    } catch (err) {
+      await this.store.release(key);
+      if (err instanceof BitPalError && err.statusCode < 500) {
+        return this.paymentRequiredUpto(resource, err.message, reqs);
+      }
+      throw err;
+    }
+
+    return {
+      kind: 'authorized',
+      status: 200,
+      paymentId: verified.payment_id,
+      payer: auth.from,
+      maxAmount: accept.amount,
+      network: accept.network,
+      release: () => Promise.resolve(this.store.release(key)),
+      charge: async (amount: string, opts?: { atomic?: boolean }): Promise<X402ChargeResult> => {
+        const atomic = opts?.atomic === true;
+        if (atomic ? !/^\d+$/.test(amount) : !/^(0|[1-9]\d*)(\.\d{1,6})?$/.test(amount)) {
+          throw new Error(
+            atomic
+              ? '[BitPal] x402: charge amountAtomic must be an integer string (USDC 6dp, $1 = "1000000").'
+              : '[BitPal] x402: charge amount must be a decimal string like "0.42" (max 6 decimals).',
+          );
+        }
+        // The wire carries atomic units, so a human amount is converted here against the ceiling's
+        //   own precision rather than a hardcoded 6 — the ceiling came from the server in atomic form.
+        const atomicAmount = atomic ? amount : humanToAtomic(amount);
+        if (BigInt(atomicAmount) > BigInt(accept.amount)) {
+          throw new Error(
+            `[BitPal] x402: charge ${atomicAmount} exceeds the approved ceiling ${accept.amount}.`,
+          );
+        }
+
+        let settled: {
+          payment_id: string;
+          status: string;
+          tx_hash: string | null;
+          fee_tx_hash?: string | null;
+          network: string;
+          idempotent?: boolean;
+        };
+        try {
+          settled = await this.request('POST', '/v1/x402/settle', envelope(atomicAmount));
+        } catch (err) {
+          if (err instanceof BitPalError && err.statusCode < 500) {
+            // Rejected outright — no funds moved, so this authorization is spent as far as we are
+            //   concerned. Release so the payer can sign a new one.
+            await this.store.release(key);
+            throw err;
+          }
+          // Unknown outcome. Keep the claim: asking for a new authorization here could double-charge.
+          return {
+            kind: 'unconfirmed',
+            message:
+              'Settlement is not confirmed yet. Retry the same charge — settlement is idempotent.',
+          };
+        }
+
+        // Charging 0 closes the payment with no on-chain transaction. The payer owes nothing and the
+        //   authorization is spent, so the claim is committed just like a confirmed charge.
+        if (settled.status === 'voided') {
+          await this.store.commit(key);
+          return { kind: 'voided', paymentId: settled.payment_id };
+        }
+
+        if (settled.status !== 'confirmed') {
+          if (RESIGN_REQUIRED_STATUSES.has(settled.status)) {
+            await this.store.release(key);
+            throw new BitPalError(`[BitPal] x402: settlement ${settled.status}.`, 402);
+          }
+          return {
+            kind: 'unconfirmed',
+            paymentId: settled.payment_id,
+            message: `Payment is still settling (${settled.status}). Retry the same charge.`,
+          };
+        }
+
+        await this.store.commit(key);
+        return {
+          kind: 'charged',
+          payment: {
+            paymentId: settled.payment_id,
+            txHash: settled.tx_hash,
+            feeTxHash: settled.fee_tx_hash ?? null,
+            network: settled.network,
+            payer: auth.from,
+            amount: atomicAmount,
+            idempotent: settled.idempotent ?? false,
+          },
+          paymentResponseHeader: encodePaymentResponseHeaderV2({
+            success: true,
+            transaction: settled.tx_hash,
+            network: settled.network,
+            payer: auth.from,
+            paymentId: settled.payment_id,
+          }),
+        };
+      },
+    };
+  }
+
+  /**
+   * v2 402. The requirements go in the `PAYMENT-REQUIRED` header, not the body — a stock v2 client
+   * reads the body only when `x402Version === 1`, so a body-only 402 is invisible to it.
+   */
+  private async paymentRequiredUpto(
+    resource: string,
+    error?: string,
+    known?: X402UptoRequirements,
+  ): Promise<X402GateResult> {
+    const reqs = known ?? (await this.uptoRequirements(resource));
+    const withError = error ? { ...reqs, error } : reqs;
+    return {
+      kind: 'payment_required',
+      status: 402,
+      // Kept for humans and for logs; machines read the header.
+      body: { error: error ?? 'PAYMENT_REQUIRED' },
+      headers: {
+        [X402_PAYMENT_REQUIRED_HEADER]: encodePaymentRequiredHeader(withError),
+        'Cache-Control': X402_PAYMENT_REQUIRED_CACHE_CONTROL,
+      },
+    };
+  }
+
+  private async uptoRequirements(resource: string): Promise<X402UptoRequirements> {
+    const reqs = (await this.requirements(resource)) as X402UptoRequirements;
+    if (reqs.x402Version !== 2 || !reqs.resource?.url) {
+      throw new BitPalError('[BitPal] x402: server did not return a v2 (upto) 402 body.', 500);
+    }
+    return reqs;
+  }
+
   /* ─── Internal ─── */
 
+  /** v1(`exact`) 전용. upto 는 `uptoRequirements()` 를 쓴다 — 402 바디 모양이 다르다. */
   private async firstAccept(resource: string): Promise<X402Accept> {
-    const requirements = await this.requirements(resource);
+    const requirements = (await this.requirements(resource)) as X402Requirements;
     const accept = requirements.accepts[0];
     if (!accept) {
       throw new BitPalError('[BitPal] x402: no payment option available for this API key mode.', 500);
@@ -526,6 +829,18 @@ export class X402Gate {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Human decimal → atomic units.
+ *
+ * x402 assets are 6-decimal stablecoins today (USDC/USDT). This stays in the SDK rather than asking
+ * the server because `charge()` has to compare against the ceiling before spending a round trip, and
+ * the comparison must be exact — string math only, never floating point.
+ */
+function humanToAtomic(amount: string, decimals = 6): string {
+  const [whole, frac = ''] = amount.split('.');
+  return `${BigInt(whole || '0') * 10n ** BigInt(decimals) + BigInt((frac + '0'.repeat(decimals)).slice(0, decimals) || '0')}`;
 }
 
 /* ─── Express adapter ─── */
@@ -583,6 +898,14 @@ export interface X402MiddlewareOptions extends X402GateOptions {
  * ```
  */
 export function x402(options: X402MiddlewareOptions) {
+  if (options.scheme === 'upto') {
+    // A transparent middleware cannot know what to charge — that is the handler's output. Use
+    //   `new X402Gate({ scheme: 'upto' })` directly and call `charge()` once the work is done.
+    throw new Error(
+      "[BitPal] x402: the Express middleware supports scheme 'exact' only. " +
+        "For 'upto', use X402Gate directly: verify with collect(), then call charge(amount) after the handler runs.",
+    );
+  }
   const gate = new X402Gate(options);
 
   return async function x402Middleware(
@@ -596,7 +919,19 @@ export function x402(options: X402MiddlewareOptions) {
         resource: resolveResource(req, options.resource),
       });
 
+      // Unreachable: the constructor rejects scheme 'upto', and only 'upto' produces 'authorized'.
+      //   Asserted rather than assumed, so a future scheme cannot silently fall through to `body`.
+      if (result.kind === 'authorized') {
+        await result.release();
+        throw new Error("[BitPal] x402: 'authorized' is not reachable from the Express middleware.");
+      }
+
       if (result.kind !== 'settled') {
+        // 402 for a v2 scheme carries its requirements in headers; dropping them makes the 402
+        //   invisible to stock clients. Harmless for v1, which sets none.
+        if (result.kind === 'payment_required' && result.headers) {
+          for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+        }
         res.status(result.status).json(result.body);
         return;
       }

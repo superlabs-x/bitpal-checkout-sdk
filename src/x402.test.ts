@@ -95,7 +95,8 @@ describe('x402 게이트 — 결제 없음', () => {
     const r = await gate().collect({ resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
     expect(r.status).toBe(402);
-    expect(r.kind === 'payment_required' && r.body.accepts[0]!.maxAmountRequired).toBe('1000000');
+    // v2(upto) 의 402 는 바디에 accepts 가 없다(헤더로 간다) — 그래서 바디 타입이 유니온이다.
+    expect(r.kind === 'payment_required' && 'accepts' in r.body && r.body.accepts[0]!.maxAmountRequired).toBe('1000000');
   });
 
   it('헤더가 깨졌으면 재서명하라고 402 로 돌려준다', async () => {

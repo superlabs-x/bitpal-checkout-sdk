@@ -4,6 +4,30 @@ All notable changes to `@bitpal/checkout`. Versions follow [semver](https://semv
 
 Source of truth: the BitPal monorepo (`packages/checkout-sdk`). The public repo `superlabs-x/bitpal-checkout-sdk` mirrors it.
 
+## 0.17.0 — 2026-11-18
+
+### Added
+- **`upto` scheme — usage-based pricing (x402 v2).** The payer approves a ceiling; you charge what the work actually cost. `new X402Gate({ scheme: 'upto', amount: '5' })`, then:
+  ```ts
+  const r = await gate.collect({ paymentSignature: req.headers['payment-signature'], resource });
+  if (r.kind !== 'authorized') { /* set r.headers, respond r.status */ }
+  const body = await doTheWork();
+  const charged = await r.charge('2.00');          // or charge('0') to close with no charge
+  res.setHeader('PAYMENT-RESPONSE', charged.paymentResponseHeader);
+  ```
+  The order is inverted on purpose: with `exact` the price is known up front and settlement happens before your handler, but with `upto` the price *is* your handler's output. New types: `X402Authorized`, `X402ChargeResult`.
+- x402 **v2 wire** helpers for merchants on other frameworks: `X402_PAYMENT_REQUIRED_HEADER`, `X402_PAYMENT_SIGNATURE_HEADER`, `X402_PAYMENT_RESPONSE_HEADER_V2`, `encodePaymentRequiredHeader`, `decodePaymentSignatureHeader`, `encodePaymentResponseHeaderV2`, and the `X402Upto*` / `Permit2Authorization` / `X402ResourceInfo` types.
+
+### Changed
+- `X402GateResult`'s `payment_required` gains `headers`. **For `upto` the requirements are in `headers['PAYMENT-REQUIRED']`, not the body** — a stock v2 client reads the body only when `x402Version === 1`, so a body-only 402 is invisible to it. The Express adapter sets them for you; hand-rolled integrations must copy every entry onto the response.
+- `X402Gate.requirements()` now returns `X402Requirements | X402UptoRequirements` depending on the gate's scheme.
+- `collect()` accepts `paymentSignature` alongside `header`.
+
+### Notes
+- **`exact` is unchanged** — v1 keeps the body + `X-PAYMENT` + `X-PAYMENT-RESPONSE`. Both transports coexist by design; the version picks one.
+- The Express `x402()` adapter is `exact`-only and throws for `scheme: 'upto'`: a transparent middleware cannot know what to charge. Use `X402Gate` directly.
+- `upto` requires the payer to approve Permit2 once per chain+token before the first payment. `exact` needed no prior transaction.
+
 ## Unreleased
 
 _Nothing yet._

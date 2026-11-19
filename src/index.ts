@@ -129,7 +129,26 @@ export type {
   Eip3009Authorization,
   X402Request,
   X402Response,
+  X402Authorized,
+  X402ChargeResult,
 } from './x402.js';
+
+// x402 v2 wire (`upto`). Merchants need the header names to set/read them on their own framework.
+export {
+  X402_PAYMENT_REQUIRED_HEADER,
+  X402_PAYMENT_SIGNATURE_HEADER,
+  X402_PAYMENT_RESPONSE_HEADER_V2,
+  decodePaymentSignatureHeader,
+  encodePaymentRequiredHeader,
+  encodePaymentResponseHeaderV2,
+} from './x402-v2.js';
+export type {
+  X402UptoRequirements,
+  X402UptoAccept,
+  X402UptoPaymentPayload,
+  X402ResourceInfo,
+  Permit2Authorization,
+} from './x402-v2.js';
 
 export { createX402Payment, normalizeSignature, TRANSFER_WITH_AUTHORIZATION_TYPES } from './x402-pay.js';
 export type {

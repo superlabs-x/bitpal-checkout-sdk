@@ -143,10 +143,18 @@ export interface CheckoutRefundRecordedData extends CheckoutRefundRecord {
 /** `x402.payment.resolved` */
 export interface X402PaymentResolvedData {
   payment_id: string;
-  status: 'confirmed' | 'reverted' | 'expired';
+  /**
+   * `uncharged_expired` is upto-only: you verified an authorization, never called `charge()`, and it expired.
+   * No funds moved and none can — revenue you served but did not bill. Charging zero on purpose is **not** this:
+   * that answers inline and fires no event.
+   */
+  status: 'confirmed' | 'reverted' | 'expired' | 'uncharged_expired';
   resource: string;
-  /** Atomic amount in the token's decimals. */
-  amount: string;
+  scheme: 'exact' | 'upto';
+  /** Atomic amount in the token's decimals. **null** when nothing was ever charged. */
+  amount: string | null;
+  /** Ceiling the payer approved (`upto` only). On `uncharged_expired`, what you could have billed. */
+  max_gross_amount: string | null;
   asset: string;
   chain: string;
   tx_hash: string | null;
