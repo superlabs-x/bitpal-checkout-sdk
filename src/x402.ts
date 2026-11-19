@@ -778,7 +778,7 @@ export class X402Gate {
 
   /* ─── Internal ─── */
 
-  /** v1(`exact`) 전용. upto 는 `uptoRequirements()` 를 쓴다 — 402 바디 모양이 다르다. */
+  /** v1 (`exact`) only. `upto` goes through `uptoRequirements()` — the 402 body has a different shape. */
   private async firstAccept(resource: string): Promise<X402Accept> {
     const requirements = (await this.requirements(resource)) as X402Requirements;
     const accept = requirements.accepts[0];
