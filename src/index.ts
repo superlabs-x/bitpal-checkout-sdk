@@ -110,10 +110,6 @@ export {
   x402,
   X402Gate,
   createMemoryReplayStore,
-  decodePaymentHeader,
-  encodePaymentHeader,
-  X402_PAYMENT_HEADER,
-  X402_PAYMENT_RESPONSE_HEADER,
 } from './x402.js';
 export type {
   X402MiddlewareOptions,
@@ -125,7 +121,6 @@ export type {
   X402Requirements,
   X402Accept,
   X402FeeBreakdown,
-  X402PaymentPayload,
   Eip3009Authorization,
   X402Request,
   X402Response,
@@ -133,19 +128,24 @@ export type {
   X402ChargeResult,
 } from './x402.js';
 
-// x402 v2 wire (`upto`). Merchants need the header names to set/read them on their own framework.
+// x402 v2 wire. **Both schemes use these** — the v1 `X-PAYMENT` envelope is gone.
+//   Merchants need the header names to set/read them on their own framework.
 export {
   X402_PAYMENT_REQUIRED_HEADER,
   X402_PAYMENT_SIGNATURE_HEADER,
   X402_PAYMENT_RESPONSE_HEADER_V2,
   decodePaymentSignatureHeader,
+  encodePaymentSignatureHeader,
   encodePaymentRequiredHeader,
   encodePaymentResponseHeaderV2,
+  isExactPayload,
 } from './x402-v2.js';
 export type {
-  X402UptoRequirements,
+  X402V2Requirements,
+  X402V2Accept,
+  X402ExactAccept,
   X402UptoAccept,
-  X402UptoPaymentPayload,
+  X402V2PaymentPayload,
   X402ResourceInfo,
   Permit2Authorization,
 } from './x402-v2.js';

@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createX402Payment, normalizeSignature } from './x402-pay.js';
-import { decodePaymentHeader } from './x402.js';
+import { decodePaymentSignatureHeader, isExactPayload } from './x402-v2.js';
 import type { X402Accept } from './x402.js';
 import type { X402TypedDataRequest } from './x402-pay.js';
 
@@ -19,15 +19,19 @@ const FROM = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const PAY_TO = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const FEE_TO = '0xcccccccccccccccccccccccccccccccccccccccc';
 
+/** v2 payload 는 scheme 별 union 이다. exact 본문을 읽을 때 좁힌다. */
+const exactBody = (h: string) => {
+  const p = decodePaymentSignatureHeader(h);
+  if (!isExactPayload(p)) throw new Error('exact payload 가 아니다');
+  return { p, auth: p.payload.authorization };
+};
+
 const ACCEPT: X402Accept = {
   scheme: 'exact',
-  network: 'base',
+  network: 'eip155:8453',
   asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
   payTo: PAY_TO,
-  maxAmountRequired: '1000000',
-  resource: 'https://api.test/report',
-  description: '',
-  mimeType: 'application/json',
+  amount: '1000000',
   maxTimeoutSeconds: 300,
   extra: { name: 'USD Coin', version: '2', chainId: 8453 },
   feeBreakdown: { netAmount: '985000', feeAmount: '15000', feeBps: 150, feeRecipient: FEE_TO },
@@ -54,7 +58,7 @@ describe('createX402Payment', () => {
     counter = 0;
     const r = recorder();
     const result = await createX402Payment({
-      requirements: { x402Version: 1, accepts: [ACCEPT] },
+      requirements: { x402Version: 2, resource: { url: 'https://api.test/report' }, accepts: [ACCEPT] },
       from: FROM,
       signTypedData: r.sign,
       randomNonce: nonce,
@@ -62,11 +66,11 @@ describe('createX402Payment', () => {
 
     // 수수료가 있어도 서명은 하나다 — 분배는 payTo 주소가 온체인에서 한다.
     expect(r.seen).toHaveLength(1);
-    const p = decodePaymentHeader(result.header);
-    expect(p.payload.authorization.to).toBe(PAY_TO);
+    const { auth } = exactBody(result.header);
+    expect(auth.to).toBe(PAY_TO);
     // net(985000)이 아니라 gross 다. net 만 보내면 서버가 AMOUNT_MISMATCH 로 거부한다.
-    expect(p.payload.authorization.value).toBe('1000000');
-    expect(p.payload.authorization.from).toBe(FROM);
+    expect(auth.value).toBe('1000000');
+    expect(auth.from).toBe(FROM);
     expect(result.totalAmount).toBe('1000000');
   });
 
@@ -78,12 +82,13 @@ describe('createX402Payment', () => {
       signTypedData: recorder().sign,
       randomNonce: nonce,
     });
-    const p = decodePaymentHeader(result.header);
+    const { p } = exactBody(result.header);
     // 이 모양이라야 순정 x402 클라이언트/서버와 상호운용된다.
     expect(Object.keys(p.payload).sort()).toEqual(['authorization', 'signature']);
     expect(p.payload.signature).toMatch(/^0x[0-9a-f]{130}$/i);
-    expect(p.scheme).toBe('exact');
-    expect(p.network).toBe('base');
+    // ★ v2 는 scheme·network 가 `accepted` 안이다 — 최상위가 아니다.
+    expect(p.accepted.scheme).toBe('exact');
+    expect(p.accepted.network).toBe('eip155:8453');
   });
 
   it('feeBreakdown 을 아예 안 봐도 된다 — 순정 402 도 동일하게 처리한다', async () => {
@@ -94,8 +99,8 @@ describe('createX402Payment', () => {
     const withoutFee = await createX402Payment({ requirements: plain as X402Accept, from: FROM, signTypedData: recorder().sign, randomNonce: nonce });
 
     // 서명 대상이 같다 — payer 입장에서 feeBreakdown 은 정보일 뿐 계약이 아니다.
-    const a = decodePaymentHeader(withFee.header).payload.authorization;
-    const b = decodePaymentHeader(withoutFee.header).payload.authorization;
+    const a = exactBody(withFee.header).auth;
+    const b = exactBody(withoutFee.header).auth;
     expect(b.to).toBe(a.to);
     expect(b.value).toBe(a.value);
   });

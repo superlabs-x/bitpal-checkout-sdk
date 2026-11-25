@@ -16,9 +16,12 @@ export const CHECKOUT_WEBHOOK_EVENTS = [
   'checkout.session.expired',
   'checkout.session.unresolved',
   'checkout.refund.recorded',
-  // Sent only for an x402 payment whose `/settle` answered 503 (outcome unknown at the time), once it is resolved
-  // on-chain. The normal path returns the result inline and does not send this event.
+  // An x402 payment reached a final outcome. Sent whichever path got there — your `settle` call or the
+  // reconciler afterwards — so make the handler idempotent; `settle` also answers inline.
   'x402.payment.resolved',
+  // We could not determine an x402 payment's outcome automatically. Not final, and `resolved` is not
+  // guaranteed to follow. Nothing for you to do; mark the call outstanding.
+  'x402.payment.needs_review',
 ] as const;
 
 export type CheckoutWebhookEvent = (typeof CHECKOUT_WEBHOOK_EVENTS)[number];
@@ -140,15 +143,27 @@ export interface CheckoutRefundRecordedData extends CheckoutRefundRecord {
   [key: string]: unknown;
 }
 
-/** `x402.payment.resolved` */
+/**
+ * `x402.payment.resolved` — an x402 payment reached a final outcome.
+ *
+ * Fired whichever path got there: your own `settle` call, or the reconciler afterwards. Which process
+ * wrote the row first is timing you do not control, so the event does not depend on it. Settle also
+ * answers inline, so **make this handler idempotent** — treat the event as the durable record of a
+ * fact you may already have acted on.
+ */
 export interface X402PaymentResolvedData {
   payment_id: string;
   /**
-   * `uncharged_expired` is upto-only: you verified an authorization, never called `charge()`, and it expired.
-   * No funds moved and none can — revenue you served but did not bill. Charging zero on purpose is **not** this:
-   * that answers inline and fires no event.
+   * Final outcomes only.
+   *
+   * `uncharged_expired` is upto-only: you verified an authorization, never called `charge()`, and it
+   * expired — revenue you served but did not bill. `voided` is upto charging zero on purpose, which is
+   * a different event: one is your choice, the other is money you lost.
+   *
+   * States still in flight and states awaiting a human never appear here, nor does an upto settlement
+   * that reverted while the authorization is still usable.
    */
-  status: 'confirmed' | 'reverted' | 'expired' | 'uncharged_expired';
+  status: 'confirmed' | 'reverted' | 'expired' | 'uncharged_expired' | 'voided';
   resource: string;
   scheme: 'exact' | 'upto';
   /** Atomic amount in the token's decimals. **null** when nothing was ever charged. */
@@ -159,7 +174,45 @@ export interface X402PaymentResolvedData {
   chain: string;
   tx_hash: string | null;
   payer: string;
-  resolved_by: 'reconciler';
+  /**
+   * Diagnostic only. Which process recorded the outcome depends on timing you do not control, so do
+   * not branch your accounting or fulfilment on it.
+   */
+  resolved_by: 'settle' | 'reconciler';
+  [key: string]: unknown;
+}
+
+/**
+ * `x402.payment.needs_review` — we could not determine the payment's outcome automatically.
+ *
+ * You already served the resource, but whether you were paid is unknown. Mark the call as outstanding
+ * and do not count it as paid or as failed.
+ *
+ * There is nothing for you to do here — recovery runs on our relayer, not yours.
+ *
+ * **This is not a final state, and a `resolved` event is not guaranteed to follow.** If the outcome
+ * stays undeterminable, it stays here. When it does resolve, `x402.payment.resolved` arrives with the
+ * same `payment_id`, and **that terminal event wins over this one** regardless of the order they reach
+ * you — so never let a late `needs_review` move a payment back out of a settled ledger.
+ */
+export interface X402PaymentNeedsReviewData {
+  payment_id: string;
+  /**
+   * Always `needs_review`. Deliberately a single value: our internal reason codes describe what
+   * evidence we have, not where the money is, and exposing them would imply a certainty we lack.
+   */
+  status: 'needs_review';
+  resource: string;
+  scheme: 'exact' | 'upto';
+  /** What the payer would have been charged, if a charge was recorded. **Not** proof it moved. */
+  amount: string | null;
+  /** Ceiling the payer approved (`upto` only; null for `exact`). */
+  max_gross_amount: string | null;
+  asset: string;
+  chain: string;
+  /** The transaction we were looking at, when there is one. It may have succeeded, failed, or be unreadable. */
+  tx_hash: string | null;
+  payer: string;
   [key: string]: unknown;
 }
 
@@ -173,6 +226,7 @@ export interface WebhookEventDataMap {
   'checkout.session.unresolved': CheckoutSessionUnresolvedData;
   'checkout.refund.recorded': CheckoutRefundRecordedData;
   'x402.payment.resolved': X402PaymentResolvedData;
+  'x402.payment.needs_review': X402PaymentNeedsReviewData;
 }
 
 /**

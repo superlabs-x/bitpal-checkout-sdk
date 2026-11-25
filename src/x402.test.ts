@@ -5,34 +5,41 @@
  * status 가 confirmed 가 아니면 리소스를 내주지 않는다.
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { X402Gate, createMemoryReplayStore, decodePaymentHeader, encodePaymentHeader } from './x402.js';
-import type { X402PaymentPayload } from './x402.js';
+import { X402Gate, createMemoryReplayStore } from './x402.js';
+import { decodePaymentSignatureHeader, encodePaymentSignatureHeader, isExactPayload } from './x402-v2.js';
+import { BitPalError } from './client.js';
+import type { X402V2PaymentPayload } from './x402-v2.js';
 
 const PAY_TO = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const ASSET = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const FROM = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const RESOURCE = 'https://api.test/report';
 
+/** v2 payload 는 scheme union 이다. exact 본문을 읽을 때 좁힌다. */
+function exactAuth(header: string) {
+  const p = decodePaymentSignatureHeader(header);
+  if (!isExactPayload(p)) throw new Error('exact payload 가 아니다');
+  return p.payload.authorization;
+}
+
 const ACCEPT = {
   scheme: 'exact' as const,
-  network: 'base',
+  network: 'eip155:8453',
   asset: ASSET,
   payTo: PAY_TO,
-  maxAmountRequired: '1000000',
-  resource: RESOURCE,
-  description: '',
-  mimeType: 'application/json',
+  amount: '1000000',
   maxTimeoutSeconds: 300,
   extra: { name: 'USD Coin', version: '2', chainId: 8453 },
   feeBreakdown: { netAmount: '985000', feeAmount: '15000', feeBps: 150, feeRecipient: '0xfee' },
 };
 
-function payload(nonce = `0x${'2'.repeat(64)}`): X402PaymentPayload {
+function payload(nonce = `0x${'2'.repeat(64)}`): X402V2PaymentPayload {
   return {
-    x402Version: 1,
-    scheme: 'exact',
-    network: 'base',
-    // x402 표준 payload — 단일 authorization + 65바이트 packed 서명.
+    x402Version: 2,
+    // ★ v2 는 scheme·network 가 `accepted` 안이다.
+    accepted: { scheme: 'exact', network: 'eip155:8453', asset: ASSET, payTo: PAY_TO, amount: '1000000' },
+    resource: { url: RESOURCE },
+    // 본문은 v1 과 같다 — 단일 authorization + 65바이트 packed 서명.
     payload: {
       signature: `0x${'1'.repeat(64)}${'3'.repeat(64)}1b`,
       authorization: {
@@ -78,7 +85,10 @@ function gate(overrides: Partial<ConstructorParameters<typeof X402Gate>[0]> = {}
   });
 }
 
-const REQUIREMENTS_OK = { status: 200, body: { data: { x402Version: 1, accepts: [ACCEPT] } } };
+const REQUIREMENTS_OK = {
+  status: 200,
+  body: { data: { x402Version: 2, resource: { url: RESOURCE }, accepts: [ACCEPT] } },
+};
 const VERIFY_OK = { status: 200, body: { data: { valid: true, payment_id: 'pay_1', status: 'created' } } };
 const SETTLE_OK = {
   status: 200,
@@ -90,20 +100,25 @@ const SETTLE_OK = {
 afterEach(() => vi.restoreAllMocks());
 
 describe('x402 게이트 — 결제 없음', () => {
-  it('X-PAYMENT 헤더가 없으면 402 + 결제 조건', async () => {
+  it('PAYMENT-SIGNATURE 가 없으면 402 + PAYMENT-REQUIRED 헤더', async () => {
     stubFetch({ '/v1/x402/requirements': [REQUIREMENTS_OK] });
     const r = await gate().collect({ resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
     expect(r.status).toBe(402);
-    // v2(upto) 의 402 는 바디에 accepts 가 없다(헤더로 간다) — 그래서 바디 타입이 유니온이다.
-    expect(r.kind === 'payment_required' && 'accepts' in r.body && r.body.accepts[0]!.maxAmountRequired).toBe('1000000');
+    // ★ 결제 조건은 **헤더**로 간다. 순정 v2 클라이언트는 바디를 읽지 않는다 —
+    //   바디에만 실으면 에이전트가 행동할 수 없는 402 가 된다.
+    const encoded = r.kind === 'payment_required' ? r.headers?.['PAYMENT-REQUIRED'] : undefined;
+    expect(encoded).toBeTruthy();
+    const decoded = JSON.parse(Buffer.from(encoded!, 'base64').toString('utf8'));
+    expect(decoded.x402Version).toBe(2);
+    expect(decoded.accepts[0].amount).toBe('1000000');
   });
 
   it('헤더가 깨졌으면 재서명하라고 402 로 돌려준다', async () => {
     stubFetch({ '/v1/x402/requirements': [REQUIREMENTS_OK] });
     const r = await gate().collect({ header: 'not-base64-json', resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
-    expect(r.kind === 'payment_required' && r.body.error).toBe('MALFORMED_PAYMENT_HEADER');
+    expect(r.kind === 'payment_required' && r.body.error).toBe('MALFORMED_PAYMENT_SIGNATURE');
   });
 });
 
@@ -114,7 +129,7 @@ describe('x402 게이트 — 정상 정산', () => {
       '/v1/x402/verify': [VERIFY_OK],
       '/v1/x402/settle': [SETTLE_OK],
     });
-    const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    const r = await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
 
     expect(r.kind).toBe('settled');
     expect(calls).toEqual(['/v1/x402/requirements', '/v1/x402/verify', '/v1/x402/settle']);
@@ -141,18 +156,20 @@ describe('x402 게이트 — 정상 정산', () => {
       }),
     );
 
-    await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
 
     const verify = sent.find(s => (s as { path: string }).path === '/v1/x402/verify') as {
       body: { paymentRequirements: Record<string, string> };
     };
     expect(verify.body.paymentRequirements).toEqual({
+      // v2 는 scheme 을 생략하지 않는다 — 받아들이는 모양이 하나면 "생략 시 무엇인가" 가 안 생긴다.
+      scheme: 'exact',
       asset: ASSET,
       payTo: PAY_TO,
       // 머천트 정산 지갑 — facilitator 가 이 값으로 payTo(정산 주소)를 재계산해 대조한다.
       //   CREATE2 는 단방향이라 payTo 에서 되돌릴 수 없어 따로 보내야 한다.
       merchant: PAY_TO,
-      maxAmountRequired: '1000000',
+      amount: '1000000',
       resource: RESOURCE,
     });
   });
@@ -166,7 +183,7 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [SETTLE_OK],
     });
     const g = gate();
-    const header = encodePaymentHeader(payload());
+    const header = encodePaymentSignatureHeader(payload());
 
     const first = await g.collect({ header, resource: RESOURCE });
     expect(first.kind).toBe('settled');
@@ -186,7 +203,7 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [SETTLE_OK],
     });
     const g = gate();
-    const header = encodePaymentHeader(payload());
+    const header = encodePaymentSignatureHeader(payload());
 
     const first = await g.collect({ header, resource: RESOURCE });
     if (first.kind !== 'settled') throw new Error('unreachable');
@@ -203,7 +220,7 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [SETTLE_OK],
     });
     const g = gate();
-    const header = encodePaymentHeader(payload());
+    const header = encodePaymentSignatureHeader(payload());
 
     const first = await g.collect({ header, resource: RESOURCE });
     expect(first.kind).toBe('settled');
@@ -218,13 +235,19 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [SETTLE_OK],
     });
     const g = gate();
-    const first = await g.collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    const first = await g.collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
     expect(first.kind).toBe('settled');
-    // 서명은 network 문자열을 덮지 않는다 — 'Base' 로 바꿔 다시 보내도 같은 키여야 한다.
-    const recased = await g.collect({ header: encodePaymentHeader({ ...payload(), network: ' Base ' }), resource: RESOURCE });
+    // 서명은 network 문자열을 덮지 않는다 — 대소문자·공백만 바꿔 보내도 같은 키여야 한다.
+    const recased = await g.collect({
+      header: encodePaymentSignatureHeader({
+        ...payload(),
+        accepted: { ...payload().accepted, network: ' EIP155:8453 ' },
+      }),
+      resource: RESOURCE,
+    });
     expect(recased.kind).toBe('unconfirmed'); // 처리 중(commit 전) — 리소스 미지급
     if (first.kind === 'settled') await first.commit();
-    const after = await g.collect({ header: encodePaymentHeader({ ...payload(), network: 'BASE' }), resource: RESOURCE });
+    const after = await g.collect({ header: encodePaymentSignatureHeader({ ...payload(), accepted: { ...payload().accepted, network: 'EIP155:8453' } }), resource: RESOURCE });
     expect(after.kind).toBe('already_used');
   });
 
@@ -235,8 +258,8 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [SETTLE_OK],
     });
     const g = gate();
-    expect((await g.collect({ header: encodePaymentHeader(payload()), resource: RESOURCE })).kind).toBe('settled');
-    const other = await g.collect({ header: encodePaymentHeader(payload(`0x${'4'.repeat(64)}`)), resource: RESOURCE });
+    expect((await g.collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE })).kind).toBe('settled');
+    const other = await g.collect({ header: encodePaymentSignatureHeader(payload(`0x${'4'.repeat(64)}`)), resource: RESOURCE });
     expect(other.kind).toBe('settled');
   });
 
@@ -247,7 +270,7 @@ describe('x402 게이트 — 재사용 차단 (결제 1건 = 응답 1건)', () =
       '/v1/x402/settle': [{ status: 503, body: { error: 'PAYMENT_PENDING' } }, SETTLE_OK],
     });
     const g = gate();
-    const header = encodePaymentHeader(payload());
+    const header = encodePaymentSignatureHeader(payload());
 
     const first = await g.collect({ header, resource: RESOURCE });
     expect(first.kind).toBe('unconfirmed');
@@ -265,7 +288,7 @@ describe('x402 게이트 — 실패 매핑', () => {
       '/v1/x402/requirements': [REQUIREMENTS_OK],
       '/v1/x402/verify': [{ status: 400, body: { error: 'AMOUNT_MISMATCH' } }],
     });
-    const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    const r = await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
     expect(r.kind === 'payment_required' && r.body.error).toBe('AMOUNT_MISMATCH');
   });
@@ -282,7 +305,7 @@ describe('x402 게이트 — 실패 매핑', () => {
         },
       ],
     });
-    const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+    const r = await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
     expect(r.kind).toBe('payment_required');
     expect(r.kind === 'payment_required' && r.body.error).toBe('PAYMENT_REVERTED');
   });
@@ -301,10 +324,40 @@ describe('x402 게이트 — 실패 매핑', () => {
           },
         ],
       });
-      const r = await gate().collect({ header: encodePaymentHeader(payload()), resource: RESOURCE });
+      const r = await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
       expect(r.kind, `status=${status}`).toBe('unconfirmed');
       expect(r.status).toBe(503);
     }
+  });
+
+  it('★ settle 이 답을 못 주면(5xx) 503 에 verify 의 payment_id 를 실어 준다', async () => {
+    // 이게 없으면 머천트는 결제를 **통째로 잃는다** — 자금은 움직였을 수 있는데 조회할 id 가
+    //   없어 GET /v1/x402/payments/:id 도, 나중에 올 웹훅과의 대조도 불가능하다.
+    stubFetch({
+      '/v1/x402/requirements': [REQUIREMENTS_OK],
+      '/v1/x402/verify': [VERIFY_OK],
+      '/v1/x402/settle': [{ status: 503, body: { error: 'PAYMENT_PENDING' } }],
+    });
+    const r = await gate().collect({ header: encodePaymentSignatureHeader(payload()), resource: RESOURCE });
+    expect(r.kind).toBe('unconfirmed');
+    expect(r.kind === 'unconfirmed' && r.body.error).toBe('SETTLEMENT_UNCONFIRMED');
+    expect(r.kind === 'unconfirmed' && 'paymentId' in r.body && r.body.paymentId).toBe('pay_1');
+  });
+
+  it('동시 요청의 503(PAYMENT_IN_PROGRESS)에는 id 가 없다 — 그 결제는 형제 요청이 들고 있다', async () => {
+    stubFetch({
+      '/v1/x402/requirements': [REQUIREMENTS_OK],
+      '/v1/x402/verify': [VERIFY_OK],
+      '/v1/x402/settle': [SETTLE_OK],
+    });
+    const g = gate();
+    const header = encodePaymentSignatureHeader(payload());
+    const [, second] = await Promise.all([
+      g.collect({ header, resource: RESOURCE }),
+      g.collect({ header, resource: RESOURCE }),
+    ]);
+    expect(second.kind).toBe('unconfirmed');
+    expect(second.kind === 'unconfirmed' && second.body.error).toBe('PAYMENT_IN_PROGRESS');
   });
 
   it('요청 검증 — payTo 형식이 틀리면 생성 시점에 막는다', () => {
@@ -341,33 +394,42 @@ describe('x402 게이트 — 실패 매핑', () => {
 describe('헤더 인코딩 / replay store', () => {
   it('encode → decode 왕복', () => {
     const p = payload();
-    expect(decodePaymentHeader(encodePaymentHeader(p))).toEqual(p);
+    expect(decodePaymentSignatureHeader(encodePaymentSignatureHeader(p))).toEqual(p);
   });
 
-  it('평문 JSON 헤더도 받아준다', () => {
+  it('평문 JSON 헤더는 거부한다 — 헤더 값은 base64 다', () => {
+    // v1 코덱은 평문 JSON 도 받아줬다. v2 는 받지 않는다 — 와이어가 base64 하나로 정해져 있고,
+    //   둘 다 받아 주면 "무엇이 유효한 헤더인가" 가 흐려진다.
     const p = payload();
-    expect(decodePaymentHeader(JSON.stringify(p))).toEqual(p);
+    expect(() => decodePaymentSignatureHeader(JSON.stringify(p))).toThrow(/base64/);
+    expect(decodePaymentSignatureHeader(encodePaymentSignatureHeader(p))).toEqual(p);
   });
 
   it('형태가 틀린 헤더는 거부한다 (인증 전 외부 입력)', () => {
-    const bad = (mut: (p: X402PaymentPayload) => void) => {
-      const p = payload();
+    type MutablePayload = X402V2PaymentPayload & {
+      payload: { signature: string; authorization: Record<string, string> };
+    };
+    const bad = (mut: (p: MutablePayload) => void) => {
+      const p = payload() as MutablePayload;
       mut(p);
-      return () => decodePaymentHeader(JSON.stringify(p));
+      // ★ base64 로 싸서 넘긴다 — 디코더가 받는 것은 헤더 값이지 JSON 문자열이 아니다.
+      return () => decodePaymentSignatureHeader(encodePaymentSignatureHeader(p));
     };
     expect(bad(p => { p.payload.authorization.from = 'nope'; })).toThrow(/authorization.from/);
     expect(bad(p => { p.payload.authorization.value = '-1'; })).toThrow(/authorization.value/);
     expect(bad(p => { p.payload.authorization.nonce = '0x1234'; })).toThrow(/authorization.nonce/);
     expect(bad(p => { p.payload.signature = '0xdead'; })).toThrow(/payload.signature/);
-    expect(bad(p => { (p as { x402Version: number }).x402Version = 2; })).toThrow(/x402Version/);
-    expect(() => decodePaymentHeader('x'.repeat(9000))).toThrow(/too large/);
+    // v2 만 받는다 — 1 은 더 이상 유효한 봉투가 아니다.
+    expect(bad(p => { (p as unknown as { x402Version: number }).x402Version = 1; })).toThrow(/x402Version/);
+    expect(() => decodePaymentSignatureHeader('x'.repeat(9000))).toThrow(/too large/);
   });
 
   it('검증된 필드만 통과시킨다 — 임의 키가 API 바디로 새지 않는다', () => {
     const p = payload() as unknown as Record<string, unknown>;
     (p.payload as { authorization: Record<string, unknown> }).authorization.__proto__x = 'evil';
     (p.payload as { authorization: Record<string, unknown> }).authorization.extra = 'junk';
-    const decoded = decodePaymentHeader(JSON.stringify(p));
+    const decoded = decodePaymentSignatureHeader(encodePaymentSignatureHeader(p as unknown as X402V2PaymentPayload));
+    if (!isExactPayload(decoded)) throw new Error('exact payload 가 아니다');
     expect(Object.keys(decoded.payload.authorization).sort()).toEqual(
       ['from', 'nonce', 'to', 'validAfter', 'validBefore', 'value'],
     );
@@ -381,5 +443,72 @@ describe('헤더 인코딩 / replay store', () => {
     expect(await store.claim('k', 300)).toBe('used');
     await store.release('k');
     expect(await store.claim('k', 300)).toBe('ok');
+  });
+});
+
+/**
+ * 상류(BitPal API)가 거절했을 때 **왜** 거절했는지가 호출자까지 살아서 가는가.
+ *
+ * 이게 끊기면 머천트는 bare string 하나만 받고, 그 위 계층은 원인을 추측하게 된다 —
+ * 실제로 데모 화면이 401(키가 다른 배포의 것)을 "env 미설정" 으로 지목했다.
+ */
+describe('상류 거절의 원인 전달', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const exactGate = () =>
+    new X402Gate({ apiKey: 'bp_test_1', payTo: PAY_TO, amount: '1', network: 'base', baseUrl: 'http://api.test' });
+
+  it('API 의 code·trace_id·retryable 을 BitPalError 에 실어 올린다', async () => {
+    stubFetch({
+      '/v1/x402/requirements': [
+        {
+          status: 401,
+          body: { error: 'Invalid or revoked API key', code: 'UNAUTHORIZED', retryable: false, trace_id: 'tr_1' },
+        },
+      ],
+    });
+    const err = await exactGate()
+      .collect({ resource: RESOURCE })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BitPalError);
+    const e = err as BitPalError;
+    expect(e.statusCode).toBe(401);
+    expect(e.message).toBe('Invalid or revoked API key');
+    // ★ 이 셋이 빠지면 "거절당했다" 만 남고 "왜" 가 사라진다.
+    expect(e.code).toBe('UNAUTHORIZED');
+    expect(e.traceId).toBe('tr_1');
+    expect(e.retryable).toBe(false);
+  });
+
+  it('JSON 이 아닌 에러 응답(게이트웨이 HTML)도 실제 상태코드를 보존한다', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('<html>502 Bad Gateway</html>', { status: 502 })),
+    );
+    const err = (await exactGate()
+      .collect({ resource: RESOURCE })
+      .then(() => null)
+      .catch((e: unknown) => e)) as BitPalError;
+
+    expect(err).toBeInstanceOf(BitPalError);
+    expect(err.statusCode).toBe(502);
+  });
+
+  it('성공 상태 + 읽을 수 없는 바디는 "결과를 모른다"(>=500)로 남긴다', async () => {
+    // 여기서 <500 으로 내리면 정산 경로가 "확실히 일어나지 않았다" 로 단정한다 — 돈은 이미
+    //   움직였을 수 있다. 미확정으로 남겨야 사후 웹훅이 결말을 알려줄 수 있다.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('not json', { status: 200 })),
+    );
+    const err = (await exactGate()
+      .collect({ resource: RESOURCE })
+      .then(() => null)
+      .catch((e: unknown) => e)) as BitPalError;
+
+    expect(err).toBeInstanceOf(BitPalError);
+    expect(err.statusCode).toBeGreaterThanOrEqual(500);
   });
 });

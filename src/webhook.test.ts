@@ -39,7 +39,7 @@ describe('@bitpal/checkout — CHECKOUT_WEBHOOK_EVENTS canonical names', () => {
     }
   });
 
-  it('이벤트 8종 정확 일치 (backend checkout-webhook.ts 와 drift 없음)', () => {
+  it('이벤트 9종 정확 일치 (backend checkout-webhook.ts 와 drift 없음)', () => {
     expect([...CHECKOUT_WEBHOOK_EVENTS].sort()).toEqual([
       'checkout.refund.recorded',
       'checkout.session.created',
@@ -48,9 +48,17 @@ describe('@bitpal/checkout — CHECKOUT_WEBHOOK_EVENTS canonical names', () => {
       'checkout.session.paid',
       'checkout.session.settled',
       'checkout.session.unresolved',
-      // x402 사후 확정만. 정상 경로(/settle 응답)는 발행되지 않는다.
+      // x402 결말 판정 불가(비종결). resolved 가 뒤따른다는 보장이 없다.
+      'x402.payment.needs_review',
+      // x402 종결. settle·reconciler 어느 쪽이 전이시켜도 발행된다.
       'x402.payment.resolved',
     ]);
+  });
+
+  it('★ needs_review 는 종결 이벤트가 아니다 — 두 x402 이벤트의 status 집합이 겹치지 않는다', () => {
+    // 겹치면 머천트가 "이 status 면 끝난 건가?" 를 이벤트 이름 없이 판정할 수 없게 된다.
+    const terminal = ['confirmed', 'reverted', 'expired', 'uncharged_expired', 'voided'];
+    expect(terminal).not.toContain('needs_review');
   });
 
   it('escrow/dispute-era dead 이벤트는 없다', () => {

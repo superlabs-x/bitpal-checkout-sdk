@@ -14,7 +14,8 @@ import { X402Gate } from './x402.js';
 import {
   decodePaymentSignatureHeader,
   X402_PAYMENT_REQUIRED_HEADER,
-  type X402UptoPaymentPayload,
+  type X402V2PaymentPayload,
+  type Permit2Authorization,
 } from './x402-v2.js';
 
 const MERCHANT = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -47,7 +48,7 @@ const REQUIREMENTS_V2 = {
   },
 };
 
-function uptoPayload(nonce = '12345678901234567890'): X402UptoPaymentPayload {
+function uptoPayload(nonce = '12345678901234567890'): X402V2PaymentPayload {
   return {
     x402Version: 2,
     resource: { url: RESOURCE, mimeType: 'application/json' },
@@ -313,9 +314,9 @@ describe('x402 upto — 헤더 파싱', () => {
 
   it('주소·숫자 필드가 망가지면 거부한다', () => {
     for (const mutate of [
-      (p: X402UptoPaymentPayload) => (p.payload.permit2Authorization.from = 'nope'),
-      (p: X402UptoPaymentPayload) => (p.payload.permit2Authorization.nonce = '0xdeadbeef'), // 10진이어야 한다
-      (p: X402UptoPaymentPayload) => (p.payload.permit2Authorization.witness.to = ''),
+      (p: X402V2PaymentPayload) => ((p.payload as { permit2Authorization: Permit2Authorization }).permit2Authorization.from = 'nope'),
+      (p: X402V2PaymentPayload) => ((p.payload as { permit2Authorization: Permit2Authorization }).permit2Authorization.nonce = '0xdeadbeef'), // 10진이어야 한다
+      (p: X402V2PaymentPayload) => ((p.payload as { permit2Authorization: Permit2Authorization }).permit2Authorization.witness.to = ''),
     ]) {
       const p = uptoPayload();
       mutate(p);
@@ -336,7 +337,7 @@ describe('x402 upto — exact 와 섞이지 않는다', () => {
   it('scheme 기본값은 exact 다', async () => {
     const bodies = stubFetch({
       '/v1/x402/requirements': [
-        { status: 200, body: { data: { x402Version: 1, accepts: [{ ...ACCEPT, scheme: 'exact' }] } } },
+        { status: 200, body: { data: { x402Version: 2, resource: { url: RESOURCE }, accepts: [{ ...ACCEPT, scheme: 'exact' }] } } },
       ],
     });
     await new X402Gate({ apiKey: 'bp_test_1', payTo: MERCHANT, amount: '1', baseUrl: 'http://api.test' })

@@ -1,7 +1,7 @@
 /**
  * x402 — merchant middleware that charges per route call.
  *
- * Merchant code only declares "this route costs $1". Building the 402, parsing `X-PAYMENT`, the
+ * Merchant code only declares "this route costs $1". Building the 402, parsing `PAYMENT-SIGNATURE`, the
  * verify → settle sequence, error mapping and replay protection all live here. BitPal computes the
  * fee and includes it in the 402, so the merchant passes **only the gross amount it wants to receive**
  * (same UX as checkout `line_items[].amount`).
@@ -9,7 +9,7 @@
  * Two things are handled with particular care:
  *
  *  1. **"One payment = one response" is the middleware's job.** BitPal `/settle` idempotency only
- *     guarantees that funds move once for a given nonce. Sending the same `X-PAYMENT` 100 times yields
+ *     guarantees that funds move once for a given nonce. Sending the same `PAYMENT-SIGNATURE` 100 times yields
  *     100 success responses, so relying on that alone would let one payment unlock unlimited calls.
  *     Authorizations that have already been served are recorded locally to block reuse (`X402ReplayStore`).
  *
@@ -18,7 +18,7 @@
  *     `status === 'confirmed'`.
  */
 
-import { BitPalError } from './client.js';
+import { BitPalError, parseApiErrorBody } from './client.js';
 import type { ApiResponse } from './types.js';
 import {
   decodePaymentSignatureHeader,
@@ -28,17 +28,22 @@ import {
   X402_PAYMENT_REQUIRED_HEADER,
   X402_PAYMENT_RESPONSE_HEADER_V2,
   X402_PAYMENT_SIGNATURE_HEADER,
+  isExactPayload,
+  type Eip3009Authorization,
+  type Permit2Authorization,
+  type X402ResourceInfo,
   type X402UptoAccept,
-  type X402UptoPaymentPayload,
-  type X402UptoRequirements,
+  type X402V2PaymentPayload,
+  type X402V2Requirements,
 } from './x402-v2.js';
+
+export type { Eip3009Authorization } from './x402-v2.js';
 
 /* ─── Constants ─── */
 
-/** payer → resource server. base64(JSON) payment payload. */
-export const X402_PAYMENT_HEADER = 'x-payment';
-/** resource server → payer. base64(JSON) settlement result (includes txHash). */
-export const X402_PAYMENT_RESPONSE_HEADER = 'X-PAYMENT-RESPONSE';
+// v1 의 `X-PAYMENT` / `X-PAYMENT-RESPONSE` 는 없앴다. 봉투가 v2 하나이므로 헤더도 하나다
+//   (`PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`, x402-v2.ts). 두 벌을 남겨 두면 어느 쪽을 읽어야
+//   하는지가 영구적인 질문으로 남는다.
 
 /**
  * Statuses returned by settle (with HTTP 200) where it is **certain that no funds moved**.
@@ -58,7 +63,7 @@ const MAX_VALIDITY_SECONDS = 3600;
 const CONSUMED_TTL_SECONDS = 24 * 60 * 60;
 /** Cap for the default in-memory store. When full, new payments are rejected (replay protection is never dropped). */
 const MEMORY_STORE_MAX_ENTRIES = 50_000;
-/** Max X-PAYMENT header size. A normal payload is well under 1KB. */
+/** Max PAYMENT-SIGNATURE header size. A normal payload is well under 1KB. */
 const MAX_PAYMENT_HEADER_BYTES = 8192;
 
 /* ─── 402 body types (values produced by the server) ─── */
@@ -72,13 +77,12 @@ export interface X402FeeBreakdown {
 
 export interface X402Accept {
   scheme: 'exact';
+  /** CAIP-2 (`eip155:8453`). v1 used hyphenated short names from a hardcoded table. */
   network: string;
   asset: string;
   payTo: string;
-  maxAmountRequired: string;
-  resource: string;
-  description: string;
-  mimeType: string;
+  /** Charge amount, atomic units. v1 called this `maxAmountRequired`. */
+  amount: string;
   maxTimeoutSeconds: number;
   /** Values the payer can use to build the EIP-712 domain as-is. */
   extra: { name: string; version: string; chainId: number };
@@ -87,21 +91,14 @@ export interface X402Accept {
 }
 
 export interface X402Requirements {
-  x402Version: 1;
+  x402Version: 2;
+  /** v2 moved resource/description/mimeType out of `accepts[]` into this object. */
+  resource: X402ResourceInfo;
   accepts: X402Accept[];
+  error?: string;
 }
 
-/* ─── X-PAYMENT payload ─── */
-
-/** Signed fields of EIP-3009 `TransferWithAuthorization`. Standard x402 `payload.authorization`. */
-export interface Eip3009Authorization {
-  from: string;
-  to: string;
-  value: string;
-  validAfter: string;
-  validBefore: string;
-  nonce: string;
-}
+/* ─── PAYMENT-SIGNATURE payload ─── */
 
 /**
  * The standard x402 payload — a single authorization plus a 65-byte packed signature.
@@ -110,17 +107,6 @@ export interface Eip3009Authorization {
  * prevented stock x402 clients from paying BitPal merchants. The split is now committed by the
  * `payTo` (forwarder) address, so a single signature is enough.
  */
-export interface X402PaymentPayload {
-  x402Version: 1;
-  scheme: 'exact';
-  /** x402 wire name — 'base' / 'base-sepolia'. */
-  network: string;
-  payload: {
-    /** 65-byte packed hex (`0x` + r + s + v). */
-    signature: string;
-    authorization: Eip3009Authorization;
-  };
-}
 
 /**
  * Normalizes an x402 network name (trim, lowercase, '-' → '_'), matching the BitPal API. Used in the replay key.
@@ -279,15 +265,15 @@ export type X402ChargeResult =
   /** Charged 0 — closed with no on-chain transaction. */
   | { kind: 'voided'; paymentId: string }
   /** Not certain whether funds moved. Do not ask the payer to re-sign; retry the same charge. */
-  | { kind: 'unconfirmed'; paymentId?: string; message: string };
+  | { kind: 'unconfirmed'; paymentId: string; message: string };
 
 export type X402GateResult =
   /**
    * No payment or an invalid one — respond with 402.
    *
-   * `body` is the v1 payload. For `upto` the requirements go in `headers` instead
-   * (`PAYMENT-REQUIRED`), because a stock v2 client never reads the body — set every entry of
-   * `headers` on the response or stock agents will not see that payment is possible.
+   * The requirements go in `headers` (`PAYMENT-REQUIRED`), not `body` — clients never read the
+   * body. Set every entry of `headers` on the response or agents will not see that payment is
+   * possible. `body` carries a human-readable error for your logs.
    */
   | {
       kind: 'payment_required';
@@ -297,8 +283,24 @@ export type X402GateResult =
     }
   /** This authorization has already been used to serve the resource — reuse rejected. */
   | { kind: 'already_used'; status: 409; body: { error: string; message: string } }
-  /** Not yet certain whether funds moved — retry with the **same** `X-PAYMENT` (do not re-sign). */
-  | { kind: 'unconfirmed'; status: 503; body: { error: string; message: string; paymentId?: string } }
+  /**
+   * Not yet certain whether funds moved — retry with the **same** `PAYMENT-SIGNATURE` (do not re-sign).
+   *
+   * The body is narrowed on `error`, because whether an id exists is not incidental:
+   *   - `SETTLEMENT_UNCONFIRMED` — we asked the facilitator to settle and got no answer. Funds may
+   *     have moved. `paymentId` is **always** here: it is the merchant's only handle for
+   *     `GET /v1/x402/payments/:id` and for matching the later webhook. Record it.
+   *   - `PAYMENT_IN_PROGRESS` — another request holds the claim for this same payment and is the one
+   *     talking to the facilitator. **This** request never learned an id, and it should not record
+   *     anything: the sibling request will.
+   */
+  | {
+      kind: 'unconfirmed';
+      status: 503;
+      body:
+        | { error: 'SETTLEMENT_UNCONFIRMED'; message: string; paymentId: string }
+        | { error: 'PAYMENT_IN_PROGRESS'; message: string };
+    }
   /**
    * Settlement confirmed — serve the resource.
    *
@@ -369,8 +371,8 @@ export class X402Gate {
    * The shape follows the scheme: `exact` returns the v1 body, `upto` the v2 one (top-level
    * `resource` object, `accepts[]` without per-entry resource strings).
    */
-  async requirements(resource: string): Promise<X402Requirements | X402UptoRequirements> {
-    return this.request<X402Requirements | X402UptoRequirements>('POST', '/v1/x402/requirements', {
+  async requirements(resource: string): Promise<X402Requirements | X402V2Requirements> {
+    return this.request<X402Requirements | X402V2Requirements>('POST', '/v1/x402/requirements', {
       payTo: this.opts.payTo,
       ...(this.scheme === 'upto' ? { scheme: 'upto' as const } : {}),
       // The server converts human-readable amounts to atomic units; the SDK does not need to know decimals.
@@ -385,37 +387,47 @@ export class X402Gate {
   }
 
   /**
-   * Processes one `X-PAYMENT` header. Returns 402 if missing or malformed, `settled` once settlement completes.
+   * Processes one `PAYMENT-SIGNATURE` header. Returns 402 if missing or malformed, `settled` once settlement completes.
    *
    * Order matters: **claim → verify → settle → record consumption**. Claiming before verify ensures that
    * concurrent submissions of the same authorization result in only one request being served.
    */
   async collect(input: {
-    /** v1 `X-PAYMENT`. */
-    header?: string | null;
-    /** v2 `PAYMENT-SIGNATURE`. Required for `upto` — stock v2 clients never send `X-PAYMENT`. */
+    /**
+     * `PAYMENT-SIGNATURE`. **Both schemes use this header** — the v1 `X-PAYMENT` envelope is gone.
+     *
+     * `header` is still accepted as an alias so callers that funnel one argument keep working;
+     * it is read as a `PAYMENT-SIGNATURE` value, not as a v1 payload.
+     */
     paymentSignature?: string | null;
+    header?: string | null;
     resource: string;
   }): Promise<X402GateResult> {
     if (this.scheme === 'upto') return this.collectUpto(input);
-    const { header, resource } = input;
-    if (!header) return this.paymentRequired(resource);
+    const { resource } = input;
+    const raw = input.paymentSignature ?? input.header;
+    if (!raw) return this.paymentRequired(resource);
 
-    let payload: X402PaymentPayload;
+    let payload: X402V2PaymentPayload;
     try {
-      payload = decodePaymentHeader(header);
+      payload = decodePaymentSignatureHeader(raw);
     } catch {
-      return this.paymentRequired(resource, 'MALFORMED_PAYMENT_HEADER');
+      return this.paymentRequired(resource, 'MALFORMED_PAYMENT_SIGNATURE');
+    }
+    // The payer picked the scheme in `accepted`. A gate configured for `exact` must not settle an
+    //   `upto` authorization — the bodies are different and the amount semantics differ (ceiling vs charge).
+    if (!isExactPayload(payload)) {
+      return this.paymentRequired(resource, 'SCHEME_MISMATCH');
     }
 
-    const auth = payload?.payload?.authorization;
+    const auth = payload.payload.authorization;
     if (!auth?.from || !auth?.nonce) {
-      return this.paymentRequired(resource, 'MALFORMED_PAYMENT_HEADER');
+      return this.paymentRequired(resource, 'MALFORMED_PAYMENT_SIGNATURE');
     }
 
     // The key scope matches EIP-3009's on-chain uniqueness scope (network + from + nonce). The network is
     //   normalized like the API does, since the signature does not cover it ('Base' and 'base' must collide).
-    const key = `${normalizeX402Network(payload.network)}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`;
+    const key = `${normalizeX402Network(payload.accepted.network)}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`;
     const claim = await this.store.claim(key, this.maxTimeoutSeconds);
     if (claim === 'used') {
       return {
@@ -433,28 +445,31 @@ export class X402Gate {
         status: 503,
         body: {
           error: 'PAYMENT_IN_PROGRESS',
-          message: 'This payment is still being settled. Retry with the same X-PAYMENT header.',
+          message: 'This payment is still being settled. Retry with the same PAYMENT-SIGNATURE header.',
         },
       };
     }
 
     // Rebuild the payment requirements ourselves — trusting payer-supplied values would allow swapping amount/recipient.
+    // 402 를 다시 내줄 때 **통째로** 필요하다(헤더 인코딩이 requirements 전체를 받는다).
+    //   accept 하나만 들고 있으면 resource/extensions 가 빠진 402 가 나간다.
+    let reqs: X402Requirements;
     let accept: X402Accept;
     try {
-      accept = await this.firstAccept(resource);
+      reqs = await this.exactRequirements(resource);
+      accept = reqs.accepts[0]!;
     } catch (err) {
       await this.store.release(key);
       throw err;
     }
 
     const body = {
-      x402Version: 1 as const,
-      paymentPayload: {
-        scheme: 'exact' as const,
-        network: payload.network,
-        payload: payload.payload,
-      },
+      x402Version: 2 as const,
+      // The payer's envelope, forwarded as-is. Rebuilding it here would drop fields the facilitator
+      //   may need (`extensions`, `resource`) and would make this a different payment than they signed.
+      paymentPayload: payload,
       paymentRequirements: {
+        scheme: 'exact' as const,
         asset: accept.asset,
         // Destination signed by the payer = settlement address committing to the split.
         payTo: accept.payTo,
@@ -462,18 +477,27 @@ export class X402Gate {
         //   CREATE2 is one-way, so it cannot be derived from payTo and must be sent separately.
         //   Uses our configured value (not read from the 402 response, which would defeat the check).
         merchant: this.opts.payTo,
-        maxAmountRequired: accept.maxAmountRequired,
-        resource: accept.resource,
+        amount: accept.amount,
+        resource,
       },
     };
 
+    // ★ Keep the id. If /settle then fails to answer, this is the ONLY handle on the payment —
+    //   without it the merchant cannot poll `GET /v1/x402/payments/:id` and the payment is simply
+    //   lost to them even though funds may have moved.
+    let paymentId: string;
     try {
-      await this.request<{ valid: boolean; payment_id: string; status: string }>('POST', '/v1/x402/verify', body);
+      const verified = await this.request<{ valid: boolean; payment_id: string; status: string }>(
+        'POST',
+        '/v1/x402/verify',
+        body,
+      );
+      paymentId = verified.payment_id;
     } catch (err) {
       await this.store.release(key);
       // 4xx = signature/amount/asset does not match. The payer must re-sign, so return 402.
       if (err instanceof BitPalError && err.statusCode < 500) {
-        return this.paymentRequired(resource, err.message, accept);
+        return this.paymentRequired(resource, err.message, reqs);
       }
       throw err;
     }
@@ -493,7 +517,7 @@ export class X402Gate {
       if (err instanceof BitPalError && err.statusCode < 500) {
         // Rejected on-chain (e.g. reverted) — no funds moved, so a new payment is needed.
         await this.store.release(key);
-        return this.paymentRequired(resource, err.message, accept);
+        return this.paymentRequired(resource, err.message, reqs);
       }
       // Unconfirmed. Returning a new 402 here could make the payer **re-sign and pay twice**.
       //   Release the claim and have them retry with the same header — /settle is idempotent, so that is safe.
@@ -504,7 +528,10 @@ export class X402Gate {
         body: {
           error: 'SETTLEMENT_UNCONFIRMED',
           message:
-            'Payment settlement is not confirmed yet. Retry this request with the same X-PAYMENT header — settlement is idempotent.',
+            'Payment settlement is not confirmed yet. Retry this request with the same PAYMENT-SIGNATURE header — settlement is idempotent.',
+          // From /verify. /settle never answered, so this is the only id we have — and the only way
+          //   the merchant can find out how this payment ended.
+          paymentId,
         },
       };
     }
@@ -515,14 +542,14 @@ export class X402Gate {
     if (settled.status !== 'confirmed') {
       await this.store.release(key);
       if (RESIGN_REQUIRED_STATUSES.has(settled.status)) {
-        return this.paymentRequired(resource, `PAYMENT_${settled.status.toUpperCase()}`, accept);
+        return this.paymentRequired(resource, `PAYMENT_${settled.status.toUpperCase()}`, reqs);
       }
       return {
         kind: 'unconfirmed',
         status: 503,
         body: {
           error: 'SETTLEMENT_UNCONFIRMED',
-          message: `Payment is still settling (${settled.status}). Retry with the same X-PAYMENT header — do not create a new payment.`,
+          message: `Payment is still settling (${settled.status}). Retry with the same PAYMENT-SIGNATURE header — do not create a new payment.`,
           paymentId: settled.payment_id,
         },
       };
@@ -534,7 +561,7 @@ export class X402Gate {
       feeTxHash: settled.fee_tx_hash ?? null,
       network: settled.network,
       payer: auth.from,
-      amount: accept.maxAmountRequired,
+      amount: accept.amount,
       idempotent: settled.idempotent ?? false,
     };
 
@@ -576,13 +603,17 @@ export class X402Gate {
     const raw = input.paymentSignature ?? input.header;
     if (!raw) return this.paymentRequiredUpto(resource);
 
-    let payload: X402UptoPaymentPayload;
+    let payload: X402V2PaymentPayload;
     try {
       payload = decodePaymentSignatureHeader(raw);
     } catch {
       return this.paymentRequiredUpto(resource, 'MALFORMED_PAYMENT_SIGNATURE');
     }
-    const auth = payload.payload.permit2Authorization;
+    // A gate configured for `upto` must not settle an `exact` authorization, and vice versa.
+    if (isExactPayload(payload)) {
+      return this.paymentRequiredUpto(resource, 'SCHEME_MISMATCH');
+    }
+    const auth = (payload.payload as { permit2Authorization: Permit2Authorization }).permit2Authorization;
 
     // Scoped like Permit2's own uniqueness scope (chain + owner + nonce). The nonce is a 256-bit
     //   value chosen by the signer, so it is compared as the decimal string the wire carries.
@@ -612,11 +643,13 @@ export class X402Gate {
     // Rebuilt server-side, never read from the payer's `accepted` — trusting it would let the payer
     //   swap the ceiling or the destination.
     let accept: X402UptoAccept;
-    let reqs: X402UptoRequirements;
+    let reqs: X402V2Requirements;
     try {
       reqs = await this.uptoRequirements(resource);
       const first = reqs.accepts[0];
-      if (!first) throw new BitPalError('[BitPal] x402: no upto payment option available for this API key mode.', 500);
+      if (!first || first.scheme !== 'upto') {
+        throw new BitPalError('[BitPal] x402: no upto payment option available for this API key mode.', 500);
+      }
       accept = first;
     } catch (err) {
       await this.store.release(key);
@@ -697,6 +730,8 @@ export class X402Gate {
           // Unknown outcome. Keep the claim: asking for a new authorization here could double-charge.
           return {
             kind: 'unconfirmed',
+            // Same reason as the exact lane: without the id the merchant cannot find out how this ended.
+            paymentId: verified.payment_id,
             message:
               'Settlement is not confirmed yet. Retry the same charge — settlement is idempotent.',
           };
@@ -752,7 +787,7 @@ export class X402Gate {
   private async paymentRequiredUpto(
     resource: string,
     error?: string,
-    known?: X402UptoRequirements,
+    known?: X402V2Requirements,
   ): Promise<X402GateResult> {
     const reqs = known ?? (await this.uptoRequirements(resource));
     const withError = error ? { ...reqs, error } : reqs;
@@ -768,8 +803,8 @@ export class X402Gate {
     };
   }
 
-  private async uptoRequirements(resource: string): Promise<X402UptoRequirements> {
-    const reqs = (await this.requirements(resource)) as X402UptoRequirements;
+  private async uptoRequirements(resource: string): Promise<X402V2Requirements> {
+    const reqs = (await this.requirements(resource)) as X402V2Requirements;
     if (reqs.x402Version !== 2 || !reqs.resource?.url) {
       throw new BitPalError('[BitPal] x402: server did not return a v2 (upto) 402 body.', 500);
     }
@@ -778,28 +813,40 @@ export class X402Gate {
 
   /* ─── Internal ─── */
 
-  /** v1 (`exact`) only. `upto` goes through `uptoRequirements()` — the 402 body has a different shape. */
-  private async firstAccept(resource: string): Promise<X402Accept> {
-    const requirements = (await this.requirements(resource)) as X402Requirements;
-    const accept = requirements.accepts[0];
-    if (!accept) {
-      throw new BitPalError('[BitPal] x402: no payment option available for this API key mode.', 500);
+  /** `exact` requirements. `upto` goes through `uptoRequirements()` — the accept shape differs. */
+  private async exactRequirements(resource: string): Promise<X402Requirements> {
+    const reqs = (await this.requirements(resource)) as X402Requirements;
+    if (reqs.x402Version !== 2 || !reqs.resource?.url) {
+      throw new BitPalError('[BitPal] x402: server did not return a v2 402 body.', 500);
     }
-    return accept;
+    const accept = reqs.accepts[0];
+    if (!accept || accept.scheme !== 'exact') {
+      throw new BitPalError('[BitPal] x402: no exact payment option available for this API key mode.', 500);
+    }
+    return reqs;
   }
 
+  /**
+   * The 402. **The requirements go in the `PAYMENT-REQUIRED` header, not the body** — a stock v2
+   * client reads the body only for `x402Version === 1`, which we no longer serve. Putting them in
+   * the body means a stock agent sees a 402 it cannot act on.
+   */
   private async paymentRequired(
     resource: string,
     error?: string,
-    known?: X402Accept,
+    known?: X402Requirements,
   ): Promise<X402GateResult> {
-    const requirements = known
-      ? { x402Version: 1 as const, accepts: [known] }
-      : await this.requirements(resource);
+    const reqs = known ?? (await this.exactRequirements(resource));
+    const withError = error ? { ...reqs, error } : reqs;
     return {
       kind: 'payment_required',
       status: 402,
-      body: error ? { ...requirements, error } : requirements,
+      // Kept for humans and for logs; machines read the header.
+      body: { error: error ?? 'PAYMENT_REQUIRED' },
+      headers: {
+        [X402_PAYMENT_REQUIRED_HEADER]: encodePaymentRequiredHeader(withError),
+        'Cache-Control': X402_PAYMENT_REQUIRED_CACHE_CONTROL,
+      },
     };
   }
 
@@ -816,11 +863,24 @@ export class X402Gate {
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
-      const json = (await res.json()) as ApiResponse<T> & { error?: unknown };
-      if (!res.ok) {
-        throw new BitPalError(String(json.error ?? `HTTP ${res.status}`), res.status);
+      // A proxy/gateway error (an HTML 502) is not JSON. `res.json()` would throw a SyntaxError that the
+      //   catch below flattens to 599, losing the real status — read the text and parse defensively.
+      const text = await res.text();
+      let json: (ApiResponse<T> & { error?: unknown }) | null = null;
+      try {
+        json = text ? (JSON.parse(text) as ApiResponse<T> & { error?: unknown }) : null;
+      } catch {
+        // A success status with an unreadable body means the outcome is **unknown**. Reporting it as <500
+        //   would tell settle "this definitely did not happen" while the money may already have moved.
+        throw new BitPalError(`Invalid JSON response (HTTP ${res.status})`, res.ok ? 599 : res.status);
       }
-      return json.data as T;
+      if (!res.ok) {
+        // Carry the API's `code` / `trace_id` / `retryable` through. `BitPalCheckoutClient` already does
+        //   this (client.ts); without it the caller gets a bare string and cannot tell *why* it was
+        //   rejected — an expired key and a disabled chain both arrive as an opaque failure.
+        throw new BitPalError(String(json?.error ?? `HTTP ${res.status}`), res.status, parseApiErrorBody(json));
+      }
+      return json?.data as T;
     } catch (err) {
       // Timeouts/network errors are treated as 5xx — for settle this routes to the "unconfirmed" path.
       if (err instanceof BitPalError) throw err;
@@ -915,7 +975,7 @@ export function x402(options: X402MiddlewareOptions) {
   ): Promise<void> {
     try {
       const result = await gate.collect({
-        header: readHeader(req, X402_PAYMENT_HEADER),
+        paymentSignature: readHeader(req, X402_PAYMENT_SIGNATURE_HEADER),
         resource: resolveResource(req, options.resource),
       });
 
@@ -936,7 +996,7 @@ export function x402(options: X402MiddlewareOptions) {
         return;
       }
 
-      res.setHeader(X402_PAYMENT_RESPONSE_HEADER, result.paymentResponseHeader);
+      res.setHeader(X402_PAYMENT_RESPONSE_HEADER_V2, result.paymentResponseHeader);
       req.x402Payment = result.payment;
 
       // Payment consumption is committed **after the response is actually sent**. If the handler throws or ends
@@ -987,48 +1047,11 @@ function resolveResource(req: X402Request, override: X402MiddlewareOptions['reso
   return `${protocol}://${host}${path}`;
 }
 
-/**
- * base64(JSON) is the standard, but plain JSON is also accepted.
- *
- * This parses untrusted input before authentication, so size limits and shape validation are enforced here —
- * only values that pass go into the replay key and BitPal API body. (The payload is never merged anywhere, so
- * there is no direct prototype-pollution path, but keys like `__proto__` are not passed through either.)
- */
-export function decodePaymentHeader(header: string): X402PaymentPayload {
-  if (header.length > MAX_PAYMENT_HEADER_BYTES) {
-    throw new Error('[BitPal] x402: X-PAYMENT header too large.');
-  }
-  const trimmed = header.trim();
-  const json = trimmed.startsWith('{') ? trimmed : decodeBase64(trimmed);
-  const parsed: unknown = JSON.parse(json);
-  return assertPaymentPayload(parsed);
-}
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const HEX32_RE = /^0x[a-fA-F0-9]{64}$/;
 const DECIMAL_RE = /^\d{1,78}$/;
 
-function assertPaymentPayload(value: unknown): X402PaymentPayload {
-  const root = asObject(value, 'payment payload');
-  if (root.x402Version !== 1) throw new Error('[BitPal] x402: unsupported x402Version.');
-  if (root.scheme !== 'exact') throw new Error('[BitPal] x402: unsupported scheme.');
-  if (typeof root.network !== 'string' || root.network.length === 0 || root.network.length > 64) {
-    throw new Error('[BitPal] x402: invalid network.');
-  }
-  const inner = asObject(root.payload, 'payload');
-  if (typeof inner.signature !== 'string' || !PACKED_SIG_RE.test(inner.signature)) {
-    throw new Error('[BitPal] x402: invalid payload.signature (expected 65-byte packed hex).');
-  }
-  return {
-    x402Version: 1,
-    scheme: 'exact',
-    network: root.network,
-    payload: {
-      signature: inner.signature,
-      authorization: assertAuthorization(inner.authorization, 'authorization'),
-    },
-  };
-}
 
 /** 65-byte packed signature — the standard x402 form. */
 const PACKED_SIG_RE = /^0x[0-9a-fA-F]{130}$/;
@@ -1062,10 +1085,6 @@ function asObject(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** Encodes a payload built by the payer helper as the `X-PAYMENT` header value. */
-export function encodePaymentHeader(payload: X402PaymentPayload): string {
-  return encodeBase64Json(payload);
-}
 
 function encodeBase64Json(value: unknown): string {
   const json = JSON.stringify(value);

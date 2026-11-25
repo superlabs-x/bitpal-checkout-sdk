@@ -77,11 +77,50 @@ export interface X402UptoAccept {
   feeBreakdown?: { feeBps: number; feeRecipient: string | null };
 }
 
-export interface X402UptoRequirements {
+/**
+ * A v2 `exact` accept. Nearly identical to `upto`; the differences are `scheme` and the absence of
+ * `extra.facilitatorAddress`.
+ *
+ * It is absent because an EIP-3009 signature names the **token itself** as `verifyingContract`, so
+ * the payer never needs one of our contract addresses. `upto` needs it because the settler address
+ * is part of the Permit2 witness.
+ */
+export interface X402ExactAccept {
+  scheme: 'exact';
+  /** CAIP-2 (`eip155:8453`). */
+  network: string;
+  asset: string;
+  /** The forwarder clone the payer signs as `authorization.to`. Not the merchant wallet. */
+  payTo: string;
+  /** Charge amount, atomic units. (v1 called this `maxAmountRequired`.) */
+  amount: string;
+  maxTimeoutSeconds: number;
+  extra: { name: string; version: string; chainId: number };
+  /** BitPal extension — stock clients ignore unknown keys. */
+  feeBreakdown?: { netAmount: string; feeAmount: string; feeBps: number; feeRecipient: string | null };
+}
+
+export type X402V2Accept = X402ExactAccept | X402UptoAccept;
+
+export interface X402V2Requirements {
   x402Version: 2;
   resource: X402ResourceInfo;
-  accepts: X402UptoAccept[];
+  accepts: X402V2Accept[];
   error?: string;
+  /**
+   * Protocol extensions the facilitator supports, **top-level and not inside `accepts`** — that is
+   * where a stock v2 client reads them from.
+   *
+   * The key that matters today is `eip2612GasSponsoring`: it tells the payer they can skip the
+   * one-time on-chain `approve(Permit2)` and sign an EIP-2612 permit instead, which the facilitator
+   * submits and pays gas for. A stock client handles this on its own — it only looks at whether the
+   * key is present, never at the value.
+   *
+   * Declared here so this passes through the gate by contract rather than by accident: the object is
+   * spread into the `PAYMENT-REQUIRED` header, so dropping the field would silently restore the
+   * approve wall with no error anywhere.
+   */
+  extensions?: Record<string, unknown>;
 }
 
 /* ─── Payment payload (v2) ─── */
@@ -104,12 +143,32 @@ export interface Permit2Authorization {
  * requirements itself and the facilitator re-derives the forwarder address from them. It is read
  * here only to route and to scope the replay key.
  */
-export interface X402UptoPaymentPayload {
+/** Signed fields of EIP-3009 `TransferWithAuthorization` — the `exact` body. */
+export interface Eip3009Authorization {
+  from: string;
+  to: string;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: string;
+}
+
+export interface X402V2PaymentPayload {
   x402Version: 2;
   resource?: X402ResourceInfo;
-  accepted: { scheme: 'upto'; network: string; [k: string]: unknown };
-  payload: { signature: string; permit2Authorization: Permit2Authorization };
+  /** `scheme` routes; the rest is payer-chosen and therefore untrusted. */
+  accepted: { scheme: 'exact' | 'upto'; network: string; [k: string]: unknown };
+  payload:
+    | { signature: string; authorization: Eip3009Authorization }
+    | { signature: string; permit2Authorization: Permit2Authorization };
   extensions?: Record<string, unknown>;
+}
+
+/** Narrowing helpers — the body shape follows `accepted.scheme`. */
+export function isExactPayload(
+  p: X402V2PaymentPayload,
+): p is X402V2PaymentPayload & { payload: { signature: string; authorization: Eip3009Authorization } } {
+  return p.accepted.scheme === 'exact';
 }
 
 /* ─── Codec ─── */
@@ -130,7 +189,7 @@ function decodeBase64Json(encoded: string): unknown {
 }
 
 /** Builds the `PAYMENT-REQUIRED` header value from a v2 402 body. */
-export function encodePaymentRequiredHeader(requirements: X402UptoRequirements): string {
+export function encodePaymentRequiredHeader(requirements: X402V2Requirements): string {
   return encodeBase64Json(requirements);
 }
 
@@ -144,6 +203,16 @@ const DECIMAL_RE = /^\d+$/;
 const HEX_RE = /^0x[0-9a-fA-F]+$/;
 
 /**
+ * Builds a `PAYMENT-SIGNATURE` header value.
+ *
+ * The payer side of {@link decodePaymentSignatureHeader}. Stock clients do this themselves; this
+ * exists for `preparePayment()` and for tests, so the two directions cannot drift apart.
+ */
+export function encodePaymentSignatureHeader(payload: X402V2PaymentPayload): string {
+  return encodeBase64Json(payload);
+}
+
+/**
  * Parses a `PAYMENT-SIGNATURE` header.
  *
  * Validation here is shape-only — it exists so a malformed header produces a clean 402 instead of a
@@ -153,7 +222,7 @@ const HEX_RE = /^0x[0-9a-fA-F]+$/;
  *
  * @throws Error when the header is not a well-formed v2 upto payload.
  */
-export function decodePaymentSignatureHeader(header: string): X402UptoPaymentPayload {
+export function decodePaymentSignatureHeader(header: string): X402V2PaymentPayload {
   if (header.length > MAX_PAYMENT_SIGNATURE_BYTES) {
     throw new Error('[BitPal] x402: PAYMENT-SIGNATURE header is too large.');
   }
@@ -172,19 +241,55 @@ export function decodePaymentSignatureHeader(header: string): X402UptoPaymentPay
     if (!ok) throw new Error(`[BitPal] x402: PAYMENT-SIGNATURE has an invalid '${what}'.`);
   };
 
+  // ── Envelope. Same for every scheme. ──
   check(p.x402Version === 2, 'x402Version');
 
   const accepted = p.accepted as Record<string, unknown> | undefined;
   check(typeof accepted === 'object' && accepted !== null, 'accepted');
-  check((accepted as Record<string, unknown>).scheme === 'upto', 'accepted.scheme');
+  const scheme = (accepted as Record<string, unknown>).scheme;
+  check(scheme === 'exact' || scheme === 'upto', 'accepted.scheme');
   const network = (accepted as Record<string, unknown>).network;
   check(typeof network === 'string' && network.length > 0, 'accepted.network');
 
   const payload = p.payload as Record<string, unknown> | undefined;
   check(typeof payload === 'object' && payload !== null, 'payload');
   const sig = (payload as Record<string, unknown>).signature;
-  // Length is not fixed: an ERC-6492 wrapper (smart-account payers) is longer than 65 bytes.
+  // Length is not fixed for `upto`: an ERC-6492 wrapper (smart-account payers) is longer than 65 bytes.
+  //   `exact` is 65 bytes because the token contract itself runs ecrecover, but the body check below
+  //   is what enforces that — the envelope stays scheme-agnostic.
   check(typeof sig === 'string' && HEX_RE.test(sig), 'payload.signature');
+
+  // ── Body. Follows `accepted.scheme`. ──
+  if (scheme === 'exact') {
+    // **65바이트 고정이다.** `upto` 와 달리 ERC-6492 래핑을 받을 수 없다 — EIP-3009 는 토큰
+    //   컨트랙트가 직접 ecrecover 하므로 래핑 서명은 온체인에서 복구되지 않는다. 여기서 막지
+    //   않으면 그 실패가 한참 뒤 브로드캐스트 시점에 드러난다.
+    check(/^0x[0-9a-fA-F]{130}$/.test(sig as string), 'payload.signature (exact must be 65 bytes)');
+
+    const auth = (payload as Record<string, unknown>).authorization as Record<string, unknown> | undefined;
+    check(typeof auth === 'object' && auth !== null, 'payload.authorization');
+    const a = auth as Record<string, unknown>;
+    check(typeof a.from === 'string' && ADDRESS_RE.test(a.from), 'authorization.from');
+    check(typeof a.to === 'string' && ADDRESS_RE.test(a.to), 'authorization.to');
+    check(typeof a.value === 'string' && DECIMAL_RE.test(a.value), 'authorization.value');
+    check(typeof a.validAfter === 'string' && DECIMAL_RE.test(a.validAfter), 'authorization.validAfter');
+    check(typeof a.validBefore === 'string' && DECIMAL_RE.test(a.validBefore), 'authorization.validBefore');
+    check(typeof a.nonce === 'string' && /^0x[0-9a-fA-F]{64}$/.test(a.nonce), 'authorization.nonce');
+
+    // **서명된 필드만 통과시킨다.** 봉투(`accepted`)는 순정이 임의 키를 싣기 때문에
+    //   passthrough 지만, `authorization` 은 EIP-3009 가 서명하는 6개가 전부다 — 그 밖의 키는
+    //   서명 대상이 아니므로 들고 갈 이유가 없고, 그대로 전달하면 API 바디로 샌다.
+    const clean = decoded as X402V2PaymentPayload;
+    (clean.payload as { authorization: Eip3009Authorization }).authorization = {
+      from: a.from as string,
+      to: a.to as string,
+      value: a.value as string,
+      validAfter: a.validAfter as string,
+      validBefore: a.validBefore as string,
+      nonce: a.nonce as string,
+    };
+    return clean;
+  }
 
   const auth = (payload as Record<string, unknown>).permit2Authorization as
     | Record<string, unknown>
@@ -205,5 +310,5 @@ export function decodePaymentSignatureHeader(header: string): X402UptoPaymentPay
   check(typeof w?.facilitator === 'string' && ADDRESS_RE.test(w.facilitator as string), 'witness.facilitator');
   check(typeof w?.validAfter === 'string' && DECIMAL_RE.test(w.validAfter as string), 'witness.validAfter');
 
-  return decoded as X402UptoPaymentPayload;
+  return decoded as X402V2PaymentPayload;
 }

@@ -4,6 +4,60 @@ All notable changes to `@bitpal/checkout`. Versions follow [semver](https://semv
 
 Source of truth: the BitPal monorepo (`packages/checkout-sdk`). The public repo `superlabs-x/bitpal-checkout-sdk` mirrors it.
 
+## 0.18.0 — 2026-11-25
+
+Both schemes now speak the same wire. `0.17.0` shipped `upto` on x402 v2 while `exact` stayed on
+v1, and the API has since moved to v2 only — so this release removes the v1 codec rather than
+leaving two envelopes and a permanent "which one do I read?" question.
+
+### Fixed
+- **A settle failure could lose you the whole payment.** `X402Gate.collect()` (`exact`) threw away
+  `payment_id` from the `/verify` response, so when `settle` returned 5xx or the network dropped,
+  the 503 carried no `paymentId`. That is the exact moment funds may have moved and you do not know:
+  you could not call `GET /v1/x402/payments/:id`, and a webhook arriving later had no key to match.
+  `paymentId` is now required, and `unconfirmed.body` splits so the id-less case is a different
+  error instead of the same shape with a missing field:
+
+  ```
+  SETTLEMENT_UNCONFIRMED   paymentId required — funds may have moved; your only handle
+  PAYMENT_IN_PROGRESS      no id — another request holds this payment and owns the ledger write
+  ```
+
+  `X402ChargeResult`'s `unconfirmed` gets the same treatment (`upto` reuses the id from the
+  authorization step).
+- A gate configured for one scheme no longer settles the other. A mismatched payload is answered
+  with 402 `SCHEME_MISMATCH`.
+
+### Breaking
+- **The v1 `X-PAYMENT` envelope is gone; `exact` uses the v2 headers too.** Removed:
+  `X402_PAYMENT_HEADER`, `X402_PAYMENT_RESPONSE_HEADER`, `encodePaymentHeader`,
+  `decodePaymentHeader`, `X402PaymentPayload`. Read the authorization from `PAYMENT-SIGNATURE` and
+  write the receipt to `PAYMENT-RESPONSE`; the 402 requirements go in `PAYMENT-REQUIRED`. The API
+  no longer accepts a v1-shaped request, so a v1 integration is already broken against production —
+  this only makes the SDK say so at compile time.
+- The v2 envelope is scheme-neutral now: `X402UptoRequirements` → `X402V2Requirements`,
+  `X402UptoPaymentPayload` → `X402V2PaymentPayload`. Envelope validation is shared and only the
+  body differs per scheme, matching how the API schema is built. `X402V2Accept` and
+  `X402ExactAccept` are new; `X402PaymentResult.payload` is now `X402V2PaymentPayload`.
+- `unconfirmed.paymentId` changed from optional to required (see Fixed). If you guarded with
+  `if (paymentId)`, the compiler will now flag that branch as dead — that guard was the bug.
+
+### Added
+- Webhook **`x402.payment.needs_review`** (`X402PaymentNeedsReviewData`) — we could not determine a
+  payment's outcome automatically and a human is looking at it. It is not a terminal state: never
+  let a late `needs_review` move a payment back out of a settled ledger.
+- `X402PaymentResolvedData.status` adds `uncharged_expired` and `voided`. `uncharged_expired` is
+  `upto`-only: you verified an authorization, never called `charge()`, and it expired —
+  `max_gross_amount` is what you could have billed and did not. `voided` is a `charge('0')` close.
+- `encodePaymentSignatureHeader` and `isExactPayload`, for merchants assembling the wire by hand.
+
+### Notes
+- `exact` still needs no prior transaction from the payer (EIP-3009). `upto` needs one Permit2
+  approval per chain + token, and on chains whose token supports EIP-2612 the 402 advertises
+  `eip2612GasSponsoring` so that approval can be a signature instead of a transaction.
+- `upto` is live on Base, Polygon and Arbitrum One. Write the chain family (`base`, `polygon`,
+  `arbitrum`); your API key's mode picks mainnet or testnet.
+
 ## 0.17.0 — 2026-11-18
 
 ### Added
@@ -27,10 +81,6 @@ Source of truth: the BitPal monorepo (`packages/checkout-sdk`). The public repo 
 - **`exact` is unchanged** — v1 keeps the body + `X-PAYMENT` + `X-PAYMENT-RESPONSE`. Both transports coexist by design; the version picks one.
 - The Express `x402()` adapter is `exact`-only and throws for `scheme: 'upto'`: a transparent middleware cannot know what to charge. Use `X402Gate` directly.
 - `upto` requires the payer to approve Permit2 once per chain+token before the first payment. `exact` needed no prior transaction.
-
-## Unreleased
-
-_Nothing yet._
 
 ## 0.16.0 — 2026-11-13
 

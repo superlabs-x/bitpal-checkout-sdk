@@ -1,5 +1,5 @@
 /**
- * x402-pay — payer-side helper. Takes a 402 response and builds the `X-PAYMENT` header.
+ * x402-pay — payer-side helper. Takes the 402 requirements and builds the `PAYMENT-SIGNATURE` header.
  *
  * BitPal's 402 can carry a fee extension (`feeBreakdown`: merchant share + platform fee share)
  * that stock x402 clients don't know about; this helper absorbs that difference on the payer side.
@@ -10,8 +10,9 @@
  * SDK has no crypto library dependency (viem / ethers / browser wallets connect in a few lines).
  */
 
-import type { Eip3009Authorization, X402Accept, X402PaymentPayload, X402Requirements } from './x402.js';
-import { encodePaymentHeader } from './x402.js';
+import type { X402Accept, X402Requirements } from './x402.js';
+import type { Eip3009Authorization, X402V2PaymentPayload } from './x402-v2.js';
+import { encodePaymentSignatureHeader } from './x402-v2.js';
 
 /** EIP-712 type definition for EIP-3009 `TransferWithAuthorization`. */
 export const TRANSFER_WITH_AUTHORIZATION_TYPES = {
@@ -78,9 +79,9 @@ export interface CreateX402PaymentOptions {
 }
 
 export interface X402PaymentResult {
-  /** Base64 string to put directly in the `X-PAYMENT` header. */
+  /** Base64 string to put directly in the `PAYMENT-SIGNATURE` header. */
   header: string;
-  payload: X402PaymentPayload;
+  payload: X402V2PaymentPayload;
   /** Total amount leaving the wallet (merchant share + fee share). */
   totalAmount: string;
 }
@@ -96,7 +97,7 @@ const MIN_VALIDITY_SECONDS = SERVER_MIN_VALIDITY_SECONDS + CLOCK_SKEW_MARGIN_SEC
 const MAX_VALIDITY_SECONDS = 3600;
 
 /**
- * 402 response -> signed `X-PAYMENT` header.
+ * 402 requirements -> signed `PAYMENT-SIGNATURE` header.
  *
  * Requires one signature: the full gross amount goes to the `payTo` forwarder address, which splits
  * any platform fee on-chain. The validity window is taken from the 402 (or `validForSeconds`)
@@ -106,12 +107,17 @@ const MAX_VALIDITY_SECONDS = 3600;
  * ```ts
  * const res = await fetch(url);
  * if (res.status === 402) {
+ *   // The terms are in the header, not the body. It is base64(JSON) — decode it directly
+ *   //   (no decode helper is exported yet; this is the inverse of encodePaymentRequiredHeader)
+ *   const requirements = JSON.parse(
+ *     Buffer.from(res.headers.get('PAYMENT-REQUIRED'), 'base64').toString('utf8'),
+ *   );
  *   const { header } = await createX402Payment({
- *     requirements: await res.json(),
+ *     requirements,
  *     from: account.address,
  *     signTypedData: (req) => walletClient.signTypedData({ account, ...req }),
  *   });
- *   const paid = await fetch(url, { headers: { 'X-PAYMENT': header } });
+ *   const paid = await fetch(url, { headers: { 'PAYMENT-SIGNATURE': header } });
  * }
  * ```
  */
@@ -149,7 +155,7 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
   const authorization: Eip3009Authorization = {
     from: options.from,
     to: accept.payTo,
-    value: accept.maxAmountRequired,
+    value: accept.amount,
     validAfter,
     validBefore,
     nonce,
@@ -164,17 +170,18 @@ export async function createX402Payment(options: CreateX402PaymentOptions): Prom
     }),
   );
 
-  const payload: X402PaymentPayload = {
-    x402Version: 1,
-    scheme: 'exact',
-    network: accept.network,
+  // v2 봉투. `scheme`·`network` 는 **`accepted` 안**이고, 결제자는 자기가 고른 조건을 통째로
+  //   메아리친다 — 서버가 "네가 동의한 게 내가 제시한 것과 같은가" 를 대조할 수 있게.
+  const payload: X402V2PaymentPayload = {
+    x402Version: 2,
+    accepted: accept as unknown as X402V2PaymentPayload['accepted'],
     payload: { signature, authorization },
   };
 
   return {
-    header: encodePaymentHeader(payload),
+    header: encodePaymentSignatureHeader(payload),
     payload,
-    totalAmount: accept.maxAmountRequired,
+    totalAmount: accept.amount,
   };
 }
 
